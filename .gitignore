@@ -9,7 +9,7 @@ output/
 *.smcl
 *.gph
 *.stswp
-tempdo.do
+**/tempdo.do
 
 # R temporary files
 .Rhistory

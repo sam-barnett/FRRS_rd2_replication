@@ -1,17 +1,24 @@
 do "C:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication\FRRS_code\src\setup_paths.do"
 
-*(2a) using mp_klms_U: rolling 6Y
-
+*(3) Dollar duration figure split by pre/post. =================================
 	use "$proc_analysis/maintable_data", clear
 
-	gen coef1=.
-	gen se1=.
-	egen ytag=tag(year)
-	forvalues i=1994/2019 {
-	areg shock_hf_30min mp_klms_U if unscheduled_meetings!=1 & year>=`i' & year<=`i'+5 ,cluster(daten) absorb(permno)
-	replace coef1=_b[mp_klms_U] if year==`i'+5
-	replace se1=_se[mp_klms_U] if year==`i'+5
+	gen coef3=.
+	gen se3=.
+	egen FpPtag=tag(Fdecile_consis post)
+
+	forvalues p=0/1 {
+	forvalues i=1/20 {
+	areg shock_hf_30min_dollar mp_klms_U if unscheduled_meetings!=1 & Fdecile_consis==`i'*5 & post==`p',cluster(daten) absorb(permno)
+	replace coef3=_b[mp_klms_U] if Fdecile_consis==`i'*5 & post==`p'
+	replace se3=_se[mp_klms_U] if Fdecile_consis==`i'*5 & post==`p'
 	}
-	gen lb = coef1 - se1
-	gen ub = coef1 + se1
-	graph twoway (rcap ub lb year, lcolor(gray) lpattern(dash)) (scatter coef1 year,  mcolor(black) msymbol(diamond)) if ytag==1, yline(0, lpattern(dash)) ytitle("{&beta}{subscript:1}") /*title("Rolling 6Y coeffs. using scheduled only")*/ xtitle("") legend(off) xscale(r(1995 2025)) xlabel(1995(5)2025)
+	}
+	gen lb3 = coef3 - se3
+	gen ub3 = coef3 + se3
+
+	graph twoway (scatter coef3 Fdecile_consis if post==0, mcolor(red)) ///
+	(scatter coef3 Fdecile_consis if post==1, mcolor(blue)) ///
+	if FpPtag==1, title("\$ 30 min") leg(order(1 "1994-2006" 2 "2007-2024")) ytitle("{&beta}{subscript:1}") xtitle("Percentile")
+
+	
