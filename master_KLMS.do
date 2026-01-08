@@ -8,7 +8,7 @@ clear all
 global code_folder "C:/Users/sb3357.SPI-9VS5N34/Princeton Dropbox/Sam Barnett/FRRS_rd2_replication/FRRS_code"
 global code_folder "C:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication\FRRS_code"
 global data_folder "C:\Users\sb3357.SPI-9VS5N34\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication\FRRS_data\data"
-global data_folder "C:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication\FRRS_data\data\data"
+global data_folder "C:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication\FRRS_data\data"
 /* ========== SET PATH TO YOUR COMPUTER'S R EXECUTABLE HERE ========== */
 global Rexe "C:/Program Files/R/R-4.4.1/bin/Rscript.exe"
 
@@ -32,6 +32,7 @@ global bootstrap_data "$data_folder/bootstrap"
 global import_fred_snapshot "$data_folder/import_fred_snapshot"
 
 sysdir set PERSONAL "$code_folder/ado"
+di "$code_folder"
 set scheme sol, perm
 
 set fredkey "030dacac32647f169b142f30fcdab33a", permanently
@@ -73,7 +74,7 @@ cap graph close
 
 
 
-
+do "$code_folder/src/tempdo.do"
 
 
 
