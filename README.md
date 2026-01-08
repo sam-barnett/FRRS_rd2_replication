@@ -24,7 +24,7 @@ The code in this replication package constructs a high-frequency FOMC date-level
 
 Two main files, data_construction_KLMS.do and analysis_KLMS.do, run all of the code to generate the data and results for the figures and tables in the paper and its appendix. The replicator should expect the code to run for about 8-16 hours.
 
-The high-frequency and quarterly data processing are largely separate from one another. The data is thus organized as follows. There is a high-frequency folder containing a raw and a processed subfolder and a quarterly folder with the same structure. There is a "proc_analysis" folder which contains only the datasets used in directly producing the tables and figures. import_fred_snapshot contains FRED data collected using Stata's "import fred" command on July 31, 2025. Lastly, there is a separate "bootstrap_calculation" subfolder in the root folder that stores the data and scripts needed to run the bootstrap for Figure A.1. 
+The replication package is organized into two main folders: FRRS_code (containing all code and ado files) and FRRS_data (containing all data). The high-frequency and quarterly data processing are largely separate from one another. The data is thus organized as follows. There is a high-frequency folder containing a raw and a processed subfolder and a quarterly folder with the same structure. There is a "proc_analysis" folder which contains only the datasets used in directly producing the tables and figures. import_fred_snapshot contains FRED data collected using Stata's "import fred" command on July 31, 2025. Lastly, there is a separate "bootstrap_calculation" subfolder in src that stores the scripts needed to run the bootstrap for Figure A.1. 
 
 # Data Availability and Provenance Statements 
 
@@ -41,7 +41,7 @@ Creative Commons Attribution 4.0 (CC-BY-4.0), except for all data in: highfreq\r
 - Confidential data used in this paper and not provided as part of the public replication package will be preserved for at least 5 years after publication, in accordance with journal policies.
 
 ## Details on each Data Source
-All data listed below is provided in the "data" subfolder. The * symbol indicates data to which the authors no longer have access.
+All data listed below is provided in the FRRS_data folder. The * symbol indicates data to which the authors no longer have access.
 
 | Data.Name  | Data.Files | Location | Provided | Citation
 | ---------- | ---------- | -------- | -------- | -------- |
@@ -115,8 +115,8 @@ All data listed below is provided in the "data" subfolder. The * symbol indicate
 - See the file CODEBOOK.pdf for a codebook of variables. 
 - All WRDS data is also documented at the links provided in the tab "Variable Descriptions." 
 
-# Dataset list (for analysis) 
-The below datasets used in creating the tables and figures in the paper are included in data\proc_analysis. 
+# Dataset list (for analysis)
+The below datasets used in creating the tables and figures in the paper are included in FRRS_data\data\proc_analysis. 
 
 | Data file  | Source | Notes | Provided | 
 | ---------- | ---------- | -------- | -------- | 
@@ -151,13 +151,14 @@ The code was last run on a 4-core Intel-based laptop running Windows 11 with 50 
 ## License for Code 
 The code is licensed under a MIT license. See LICENSE.txt in the root folder for details.
 
-# Instructions to Replicators 
-## Details 
-- Install necessary packages for R as described in the "Software Requirements" section (e.g., by running the file R_load_packages.R). 
-- Open master_KLMS.do in the root folder. Change the following paths: 
-  - The path to the root folder on your computer on line 8
-  - The path to your computer's R executable on line 10
-  - (Optional) Comment out line 53, which pulls the raw 5-minute stock data from WRDS
+# Instructions to Replicators
+## Details
+- Install necessary packages for R as described in the "Software Requirements" section (e.g., by running the file R_load_packages.R).
+- Open master_KLMS.do in the FRRS_code folder. Change the following paths:
+  - The path to the code folder on your computer (lines 8-9)
+  - The path to the data folder on your computer (lines 10-11)
+  - The path to your computer's R executable (line 13)
+  - (Optional) Comment out line 59, which pulls the raw 5-minute stock data from WRDS
 - Run master_KLMS.do. 
 
 Because of the computationally-intensive nature of the file "import_intraday_whole_year.R", it may be desirable to run it in a dedicated IDE such as Rstudio. 
@@ -183,7 +184,7 @@ Figure 5 	| analysis_KLMS.do 	| 723  | test_avg_borrowing_cost_gk_updated.pdf |
 Figure 6 	| analysis_KLMS.do 	| 816  | all8_IRFs_baseline.pdf | 	 
 Figure 7 	| analysis_KLMS.do 	| 910  | news_controls_All_double_gk_alt.pdf | 	 
 Figure 8 	| analysis_KLMS.do 	| 1039  | controls_All_gk_alt.pdf.pdf | 	 
-Figure A.1 	| analysis_KLMS.do, bootstrap_calculation\bootstrap_calculation.do 	| 1190, 1 (resp.)  | placebo_duration.pdf | 	  
+Figure A.1 	| analysis_KLMS.do, bootstrap_calculation\bootstrap_calculation.do 	| 1190, 1 (resp.)  | placebo_duration.pdf |  
 Figure A.2 	| analysis_KLMS.do 	| 1214, 1300  | appendix_all8_IRFs_IND5_FFRBAR.pdf | 	 
 Figure A.3 	| analysis_KLMS.do 	| 1214, 1333  | appendix_all8_IRFs_IND5_WIDESHOCK.pdf | 	 
 Figure A.4 	| analysis_KLMS.do 	| 1361  | rob8ahead_all.pdf | 	
