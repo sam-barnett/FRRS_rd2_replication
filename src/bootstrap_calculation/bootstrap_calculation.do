@@ -1,9 +1,16 @@
-*bootstrap python file 
+*bootstrap python file
+
+* Pass the bootstrap_data global to Python
+local bootstrap_data "$bootstrap_data"
 
 python:
 import numpy as np
 import pandas as pd
 from sklearn.linear_model import LinearRegression
+from sfi import Macro
+
+# Get bootstrap data path from Stata
+bootstrap_data = Macro.getLocal("bootstrap_data")
 
 def regress(data, yvar, xvar):
     # keep permno so we can group on it
@@ -26,7 +33,7 @@ def one_bootstrap():
     return coefficients_df
 
 # Load and prep dataset
-df_raw = pd.read_stata("master_daily_placebo_calculation_UPDATE.dta")
+df_raw = pd.read_stata(f"{bootstrap_data}/master_daily_placebo_calculation_UPDATE.dta")
 df_original = df_raw.copy()
 
 # Getting the FOMC groups
@@ -60,5 +67,5 @@ main_coeff = regress(df_main, "shock_hf_30min", "mp_klms")
 results_all = [main_coeff] + results
 label_all = ["Regular"] + ["Placebo"] * boot_count
 export_df = pd.DataFrame({'Estimates': results_all, 'Type': label_all})
-export_df.to_csv("bootstrap_placebo.csv", index = False)
+export_df.to_csv(f"{bootstrap_data}/bootstrap_placebo.csv", index = False)
 end

@@ -276,7 +276,7 @@ import delimited "${rawh}/TickWrite/Eurodollars_FF_updated/ED`month'`year'.csv",
 	}
 	else{
 		append using "${proch}/eurodollar_futures_14_24.dta"
-		sleep 500 // helps with read-only errors 
+		sleep 800 // helps with read-only errors 
 		save "${proch}/eurodollar_futures_14_24.dta", replace
 	}
 	}
@@ -303,7 +303,7 @@ import delimited "$rawh/TickWrite/SOFR_all/SR3`month'`year'all.csv", clear
 	gen hour = hh(timen)
 	gen minute = mm(timen)
 		append using "${proch}/eurodollar_futures_14_24.dta"
-		sleep 500 // helps with read-only errors 
+		sleep 800 // helps with read-only errors 
 		save "${proch}/eurodollar_futures_14_24.dta", replace
 	}
 	}
@@ -341,7 +341,7 @@ import delimited "$rawh/TickWrite/SOFR_all/SR3`month'`year'all.csv", clear
 	rename exp_quarter quarter_`q'_ahead
 	keep daten hour minute fomc_id quarter* sofr time 
 	save "${proch}/fomc_hour_bonds_eurodollar_14_24.dta", replace
-	sleep 500
+	sleep 800
 	}
 	replace quarter_2 = quarter_2 + 1 if quarter_1 == quarter_2
 	replace quarter_3 = quarter_3 + 1 if quarter_2 == quarter_3 // I think this was mistake earlier, "replace quarter 3  =quarter_2 +1"
@@ -668,7 +668,7 @@ import delimited "$rawh/WRDS/us_treasury_govpx/`dt'-GOVPX_NEX_UST_0_0.csv", clea
 		if `counter' > 1 {
 			append using "${proch}/`year'_HF_Treasury.dta"
 		}
-		sleep 500 // helps with read-only errors 
+		sleep 800 // helps with read-only errors 
 		save "${proch}/`year'_HF_Treasury.dta", replace 
 		local ++counter
 	}
@@ -703,7 +703,7 @@ import delimited "$rawh/WRDS/us_treasury_govpx/tbills_highfreq/`year'hig_freq_`m
 	if `iter' > 0 {
 		append using "${proch}/bond_highfreq_post_200924.dta"
 	}
-	sleep 500 // helps with read-only errors 
+	sleep 800 // helps with read-only errors 
 	save "${proch}/bond_highfreq_post_200924.dta", replace
 	local iter = `iter' + 1
 	
@@ -733,10 +733,10 @@ import delimited "$rawh/WRDS/us_treasury_govpx/tbills_highfreq/`year'hig_freq_`m
 	if `iter' > 0 {
 		append using "${proch}/bond_highfreq_pre_200924.dta", force
 	}
-	sleep 500 // helps with read-only errors 
+	sleep 800 // helps with read-only errors 
 	save "${proch}/bond_highfreq_pre_200924.dta", replace
 	local iter = `iter' + 1
-	sleep 500
+	sleep 800
 	}
 	}
 	
@@ -770,7 +770,7 @@ import delimited "$rawh/WRDS/us_treasury_govpx/tbills_highfreq/`year'hig_freq_`m
 	preserve
 	keep if hour == 16 & minute == 55
 	keep daten yield
-	sleep 500 // helps with read-only errors 
+	sleep 800 // helps with read-only errors 
 	save "${proch}/bond_check_`mat'24.dta", replace
 	restore
 	gsort daten hour minute id // stable (id) added 6/2
@@ -800,7 +800,7 @@ import delimited "$rawh/WRDS/us_treasury_govpx/tbills_highfreq/`year'hig_freq_`m
 	by daten: gen shock_`mat'_30min = yield - yield[_n-1]
 	keep if (first_obs == 1) & (fomc_diff == 1)
 	keep quarter shock daten
-	sleep 500 // helps with read-only errors 
+	sleep 800 // helps with read-only errors 
 	save "${proch}/`mat'_shocks24.dta", replace
 	restore
 	*** 60 min window
@@ -822,7 +822,7 @@ import delimited "$rawh/WRDS/us_treasury_govpx/tbills_highfreq/`year'hig_freq_`m
 		disp "here0!"
 	merge 1:1 daten using "${proch}/`mat'_shocks24.dta", nogen
 		disp "here1!"
-	sleep 500 // helps with read-only errors 
+	sleep 800 // helps with read-only errors 
 	save "${proch}/`mat'_shocks24.dta", replace
 	restore
 }
@@ -997,7 +997,7 @@ forval year = 1994/2024 {
 	if `iter' > 0 {
 		append using "${proch}/temp_stock_fomc_level24.dta"
 	}
-	sleep 500 
+	sleep 800 
 	save "${proch}/temp_stock_fomc_level24.dta", replace // =====================
 	local iter = `iter' + 1
 	}
@@ -1461,7 +1461,7 @@ import excel "$rawq/Bloomberg/BCOM_94_24.xlsx", firstrow clear
 	gen log_bcom = log(bcom)
 	gen log_bcomag = log(bcomag)
 	save "$procq/newdailyshocks", replace 
-	sleep 500 
+	sleep 800 
 	
 ** (4) SP500: TickWrite in library, daily (close) price of index 
 import delimited "$rawq/TickWrite/SPall_daily.csv", clear 
@@ -1472,7 +1472,7 @@ import delimited "$rawq/TickWrite/SPall_daily.csv", clear
 	keep daten log_SP500
 	merge 1:1 daten using "$procq/newdailyshocks", nogen 
 	save "$procq/newdailyshocks", replace 
-	sleep 500 
+	sleep 800 
 
 ** (5) Slope yield curve 	
 *import fred T10Y3M, clear // slope of Treasury yield curve, daily	
@@ -1481,7 +1481,7 @@ use "$import_fred_snapshot/T10Y3M.dta", clear
 	replace T10Y3M = T10Y3M[_n - 1] if missing(T10Y3M)
 	merge 1:1 daten using "$procq/newdailyshocks", nogen 
 	save "$procq/newdailyshocks", replace 
-	sleep 500 
+	sleep 800 
 
 ** (6) Payroll, unemployment, core CPI surprise 
 *for these we need "money market services" survey data.
@@ -1569,7 +1569,7 @@ import delimited "$rawq/payroll_asreleased.csv", clear
 	drop release_date
 	merge 1:1 daten using "$procq/newdailyshocks", nogen 
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 
 	*Unemp 
 	use "$procq/MMS_reuters_expectations.dta", clear 
@@ -1595,7 +1595,7 @@ import delimited "$rawq/unemp_asreleased.csv", clear
 // 	gen quarter=qofd(daten)
 // 	format quarter %tq
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 	
 	*Core CPI 
 	use "$procq/MMS_reuters_expectations.dta", clear 
@@ -1622,7 +1622,7 @@ import delimited "$rawq/cpi_asreleased.csv", clear
 	drop daten 
 	merge 1:m month using "${procq}/newdailyshocks.dta", nogen
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 
 ** (7) Blue Chip GDP Forecasts, for rgdp_surprise: Accessible through Haver Analytics in Library. 
 * Process: follow the process at this link closely: https://libguides.princeton.edu/ld.php?content_id=17176779
@@ -1704,7 +1704,7 @@ import delimited "$rawq/gdp_asreleased.csv", clear
 	keep daten rgdp_surprise rgdp_actual rgdp_expec
 	merge 1:1 daten using "${procq}/newdailyshocks.dta", nogen
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 
 ** (8) BBK: monthly "Brave-Butters-Kelley RGDP", found here https://fred.stlouisfed.org/series/BBKMGDP
 import delimited "$rawq/FRED/fred_bbk_90_25.csv", clear 
@@ -1717,7 +1717,7 @@ import delimited "$rawq/FRED/fred_bbk_90_25.csv", clear
 	keep lag_bbk month 
 	merge 1:m month using "${procq}/newdailyshocks.dta", nogen
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 
 ** (9) Core CPI expec, monthly variable 
 	use "$procq/MMS_reuters_expectations.dta", clear 
@@ -1731,7 +1731,7 @@ import delimited "$rawq/FRED/fred_bbk_90_25.csv", clear
 	merge 1:m month using "${procq}/newdailyshocks.dta", nogen
 		drop if missing(daten) // core cpi goes before bcom 
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 	
 ** (10) core CPI actual change over time (Bauer/Swanson variable, 6mo change)
 *import fred CPILFESL, clear // core cpi , m
@@ -1745,7 +1745,7 @@ use "$import_fred_snapshot/CPILFESL.dta", clear
 	merge 1:m month using "${procq}/newdailyshocks.dta", nogen
 		drop if missing(daten) // same again 
 	save "${procq}/newdailyshocks.dta", replace
-	sleep 500
+	sleep 800
 	
 	*Final processing of news shocks: inter-FOMC "news"
 	use "${proch}/fomc_times_2024.dta", clear 
@@ -2128,9 +2128,9 @@ import delimited "$rawq/WRDS/b_mkt_20_24.csv", clear
 	replace shock_hf_30min = shock_hf_30min * 100 
 	merge m:1 daten using `shokplacebo', nogen keep(master matched)
 	merge m:1 permno using "$procq/mainsample_list_update.dta", nogen keep(matched) // main sample consistent w HF
-	gsort permno 
-	format daten %td 
-	save "$bootstrap_calculation/master_daily_placebo_calculation_UPDATE.dta", replace 
+	gsort permno
+	format daten %td
+	save "$bootstrap_data/master_daily_placebo_calculation_UPDATE.dta", replace
 	// can see that there are the same # of firms in the above data as in "maintable_data"	using: 
 	// codebook permno if !missing(mp_klms) & !missing(shock_hf_30min)
 
