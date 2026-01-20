@@ -74,8 +74,3 @@ cap graph close
 
 
 
-do "$code_folder/src/tempdo.do"
-
-
-
-
