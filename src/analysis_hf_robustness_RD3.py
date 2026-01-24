@@ -34,10 +34,11 @@ print("="*80)
 
 # Define paths (matching Stata setup_paths.do)
 base_path = Path(r"c:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication")
+# base_path = Path(r"C:\Users\sb3357.SPI-9VS5N34\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication")
 data_path = base_path / "FRRS_data" / "data"
 proc_analysis = data_path / "proc_analysis"
-output_tab = base_path / "FRRS_data" / "output" / "tables" / "rd2_reports"
-output_fig = base_path / "FRRS_data" / "output" / "figures" / "rd2_reports"
+output_tab = base_path / "FRRS_data" / "sandbox_jan2026"
+output_fig = base_path / "FRRS_data" / "sandbox_jan2026"
 
 # Create output directories if needed
 output_tab.mkdir(parents=True, exist_ok=True)
@@ -49,23 +50,9 @@ output_fig.mkdir(parents=True, exist_ok=True)
 # ============================================================================
 
 print("\n[1/9] Loading maintable_data.dta and FOMC-level data...")
-
 # Load the main analysis dataset
 dta_file = proc_analysis / "maintable_data.dta"
 df, meta = pyreadstat.read_dta(str(dta_file))
-
-print(f"   - Loaded firm-level data: {len(df):,} observations")
-print(f"   - Variables: {len(df.columns)}")
-
-# Load FOMC-level data with synthetic 1Y rate and yield curve
-fomc_file = proc_analysis / "master_fomc_level_24.dta"
-df_fomc, meta_fomc = pyreadstat.read_dta(str(fomc_file))
-print(f"   - Loaded FOMC-level data: {len(df_fomc):,} observations")
-
-# Merge FOMC-level variables into firm-level data
-fomc_vars = ['daten', 'zcoupon_1y', 'shock_2Y_30min', 'shock_10Y_30min']
-df = df.merge(df_fomc[fomc_vars], on='daten', how='left')
-print(f"   - Merged FOMC-level variables: {fomc_vars[1:]}")
 
 # ============================================================================
 # CONSTRUCT SYNTHETIC 1Y FORWARD RATE FROM FUTURES
@@ -115,7 +102,7 @@ print(f"   - Loaded FF futures: {len(df_ff):,} obs on FOMC dates")
 print("   - Loading ED futures (filtering to FOMC dates in chunks)...")
 ed_futures_file = data_path / "highfreq" / "proc" / "eurodollar_futures_14_24.dta"
 ed_shards = []
-chunksize = 5_000_000 # Read in 5M chunks to be safe but reasonable speed
+chunksize = 20_000_000 # Read in 5M chunks to be safe but reasonable speed
 
 # Use pandas iterator for chunked reading
 try:
@@ -155,26 +142,34 @@ except Exception as e:
     df_ed = pd.DataFrame()
 
 # Function to get pre-shock futures rate (last trade before FOMC window)
-def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id, contract_col='exp_month', lower_min=-10):
+def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filter_col, value_col, lower_min=-10, cast_int=True):
     """
-    Get the pre-shock futures rate: last trade before the FOMC announcement window.
-    contract_id: the expiration identifier (month for FF, quarter for ED)
-    contract_col: column name to match contract_id ('exp_month' or 'exp_quarter')
+    Get the pre-shock value: last observation before the FOMC announcement window.
+
+    Parameters:
+        df: DataFrame with trade/quote data
+        fomc_date: date of FOMC announcement
+        fomc_hour, fomc_minute: time of FOMC announcement
+        filter_value: value to filter on (e.g., contract month, maturity)
+        filter_col: column name to filter on (e.g., 'exp_month', 'mat')
+        value_col: column name containing the value to return (e.g., 'rate', 'yield')
+        lower_min: minutes before announcement for cutoff (default -10)
+        cast_int: whether to cast filter_value to int for matching (default True)
     """
-    if futures_df.empty:
+    if df.empty:
         return np.nan
 
-    # Filter to FOMC date and contract
-    # Ensure contract_id matching works (int vs int)
-    mask = (futures_df['date'] == fomc_date) & (futures_df[contract_col] == int(contract_id))
-    day_data = futures_df[mask].copy()
+    # Filter to FOMC date and specified filter
+    filter_val = int(filter_value) if cast_int else filter_value
+    mask = (df['date'] == fomc_date) & (df[filter_col] == filter_val)
+    day_data = df[mask].copy()
 
     if len(day_data) == 0:
         return np.nan
 
     # FOMC time in minutes from midnight
     fomc_time_min = fomc_hour * 60 + fomc_minute
-    cutoff_min = fomc_time_min + lower_min  # 10 minutes before announcement
+    cutoff_min = fomc_time_min + lower_min  # e.g., 10 minutes before announcement
 
     # Get trades before cutoff
     # Prioritize usage of explicit hour/minute columns if available
@@ -183,7 +178,7 @@ def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id
     else:
         # Fallback to parsing timen
         sample_timen = day_data['timen'].iloc[0] if len(day_data) > 0 else None
-        
+
         if sample_timen is not None:
             if hasattr(sample_timen, 'hour'):
                 # datetime.time object
@@ -206,10 +201,20 @@ def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id
     if len(pre_shock) == 0:
         return np.nan
 
-    # Return the last pre-shock rate
+    # Return the last pre-shock value
     # sort by trade_min to be sure we get the last one
     pre_shock = pre_shock.sort_values('trade_min')
-    return pre_shock.iloc[-1]['rate']
+    return pre_shock.iloc[-1][value_col]
+
+
+def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id, contract_col='exp_month', lower_min=-10):
+    """
+    Get the pre-shock futures rate: last trade before the FOMC announcement window.
+    contract_id: the expiration identifier (month for FF, quarter for ED)
+    contract_col: column name to match contract_id ('exp_month' or 'exp_quarter')
+    """
+    return get_preshock_value(futures_df, fomc_date, fomc_hour, fomc_minute,
+                              contract_id, contract_col, 'rate', lower_min, cast_int=True)
 
 # Compute synthetic 1Y forward rate
 synthetic_rates = []
@@ -354,30 +359,8 @@ def get_preshock_bond_yield(bonds_df, fomc_date, fomc_hour, fomc_minute, maturit
     """
     Get pre-shock bond yield for a given maturity (2Y, 5Y, 10Y).
     """
-    if bonds_df.empty:
-        return np.nan
-
-    # Filter to FOMC date and maturity
-    mask = (bonds_df['date'] == fomc_date) & (bonds_df['mat'] == maturity)
-    day_data = bonds_df[mask].copy()
-
-    if len(day_data) == 0:
-        return np.nan
-
-    # FOMC time in minutes from midnight
-    fomc_time_min = fomc_hour * 60 + fomc_minute
-    cutoff_min = fomc_time_min + lower_min  # 10 minutes before announcement
-
-    # Get trades before cutoff
-    day_data['trade_min'] = day_data['hour'] * 60 + day_data['minute']
-    pre_shock = day_data[day_data['trade_min'] < cutoff_min]
-
-    if len(pre_shock) == 0:
-        return np.nan
-
-    # Return the last pre-shock yield
-    pre_shock = pre_shock.sort_values('trade_min')
-    return pre_shock.iloc[-1]['yield']
+    return get_preshock_value(bonds_df, fomc_date, fomc_hour, fomc_minute,
+                              maturity, 'mat', 'yield', lower_min, cast_int=False)
 
 # Compute synthetic 10Y expected rate
 synthetic_10y_rates = []
@@ -484,8 +467,8 @@ if n_missing > 0:
     missing_df = df_synthetic_10y[df_synthetic_10y['synthetic_10y_rate'].isna()].copy()
     if 'missing_futures' in missing_df.columns and 'missing_treasury' in missing_df.columns:
         # Count missing by component
-        futures_missing_count = missing_df['missing_futures'].apply(lambda x: len(x.split(',')) if x else 0).sum()
-        treasury_missing_count = missing_df['missing_treasury'].apply(lambda x: len(x.split(',')) if x else 0).sum()
+        futures_missing_count = missing_df['missing_futures'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
+        treasury_missing_count = missing_df['missing_treasury'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
 
         # Find most common missing components
         all_missing_futures = ','.join(missing_df['missing_futures'].dropna()).split(',')
@@ -513,6 +496,37 @@ for col in ['synthetic_5y_rate', 'synthetic_10y_rate']:
     if col in df.columns:
         df = df.drop(columns=[col])
 df = df.merge(df_synthetic_10y[['daten', 'synthetic_5y_rate', 'synthetic_10y_rate']], on='daten', how='left')
+
+# ============================================================================
+# LINEARLY INTERPOLATE MISSING SYNTHETIC RATES (at FOMC-date level)
+# ============================================================================
+print("\n   Interpolating missing synthetic rates at FOMC-date level...")
+
+# Get unique FOMC dates with their synthetic rates
+fomc_dates = df[['daten']].drop_duplicates().sort_values('daten').reset_index(drop=True)
+synthetic_cols = ['synthetic_1y_rate', 'synthetic_5y_rate', 'synthetic_10y_rate']
+
+# For each synthetic rate, get the unique values per FOMC date and interpolate
+for col in synthetic_cols:
+    if col in df.columns:
+        # Get unique date-rate pairs (take first non-null per date if multiple)
+        date_rates = df.groupby('daten')[col].first().reset_index()
+        date_rates = date_rates.sort_values('daten')
+
+        n_missing_before = date_rates[col].isna().sum()
+        n_total = len(date_rates)
+
+        # Linearly interpolate
+        date_rates[col] = date_rates[col].interpolate(method='linear')
+
+        n_missing_after = date_rates[col].isna().sum()
+        n_filled = n_missing_before - n_missing_after
+
+        print(f"   - {col}: {n_filled} of {n_missing_before} missing FOMC dates filled ({n_total} total dates)")
+
+        # Merge interpolated values back to main df
+        df = df.drop(columns=[col])
+        df = df.merge(date_rates[['daten', col]], on='daten', how='left')
 
 # ============================================================================
 # LOAD DGS2 FROM FRED
@@ -729,7 +743,7 @@ df_work = df_sched.copy()
 print(f"\n   Final working sample: {len(df_work):,} observations")
 
 # Save sandbox data for analysis
-sandbox_dir = Path(__file__).parent.parent.parent / "FRRS_data" / "sandbox_jan26"
+sandbox_dir = Path(__file__).parent.parent.parent / "FRRS_data" / "sandbox_jan2026"
 sandbox_dir.mkdir(parents=True, exist_ok=True)
 sandbox_file = sandbox_dir / "sandbox_data.csv"
 df_work.to_csv(sandbox_file, index=False)
@@ -856,6 +870,16 @@ def run_specification(df, post_var_name, spec_label, include_post_term=True,
 # ============================================================================
 # PHASE 5-8: RUN ALL SPECIFICATIONS
 # ============================================================================
+
+# Option to load pre-constructed sandbox data (skip data construction phases)
+# Path relative to FRRS_code/src (go up two levels to reach FRRS_data)
+sandbox_data_path = Path(__file__).parent.parent.parent / "FRRS_data" / "sandbox_jan2026" / "sandbox_data.csv"
+if sandbox_data_path.exists():
+    print(f"Loading sandbox data from {sandbox_data_path}...")
+    df_work = pd.read_csv(sandbox_data_path)
+    print(f"Loaded {len(df_work):,} observations")
+else:
+    print(f"Error: {sandbox_data_path} not found. Run data construction phases first.")
 
 results_dict = {}
 
@@ -1077,6 +1101,142 @@ if results_dict:
 
     print(f"Detailed results saved to: {detail_file}")
 
+    # ========================================================================
+    # LATEX TABLE OUTPUT - Main Interaction Specifications
+    # ========================================================================
+    print("\n" + "="*80)
+    print("GENERATING LATEX TABLE")
+    print("="*80)
+
+    # Define the 6 specifications for the LaTeX table
+    latex_specs = [
+        ('post_original', 'Original', '(2007-2024)'),
+        ('post_alt', 'Revised', '(2007-2021)'),
+        ('target_ma5_forward', 'MA5', 'Forward'),
+        ('target_ma10_forward', 'MA10', 'Forward'),
+        ('synthetic_5y_rate', 'Synthetic', '5Y Rate'),
+        ('synthetic_10y_rate', 'Synthetic', '10Y Rate'),
+    ]
+
+    # Run specifications and collect results
+    latex_results = {}
+    for var_name, col_label, col_sublabel in latex_specs:
+        if var_name in df_work.columns and df_work[var_name].notna().sum() > 100:
+            try:
+                res, n, r2 = run_specification(df_work, var_name, f'LaTeX: {var_name}', quiet=True)
+                latex_results[var_name] = {'res': res, 'n': n, 'r2': r2, 'label': col_label, 'sublabel': col_sublabel}
+                print(f"   {var_name}: N={n:,}, R2={r2:.4f}")
+            except Exception as e:
+                print(f"   {var_name}: ERROR - {e}")
+        else:
+            print(f"   {var_name}: SKIPPED (missing or insufficient data)")
+
+    # Build LaTeX table
+    def format_coef(coef, se, pval):
+        """Format coefficient with stars and SE in parentheses"""
+        stars = '***' if pval < 0.01 else '**' if pval < 0.05 else '*' if pval < 0.10 else ''
+        return f"{coef:.4f}{stars}", f"({se:.4f})"
+
+    # Start LaTeX table
+    n_cols = len(latex_results)
+    col_align = 'l' + 'c' * n_cols
+
+    latex_lines = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{High-Frequency Stock Response: Alternative Rate Specifications}",
+        r"\label{tab:hf_robustness}",
+        r"\begin{tabular}{" + col_align + "}",
+        r"\toprule",
+    ]
+
+    # Header rows (two rows: main label and sublabel)
+    header1 = " & ".join([""] + [latex_results[v]['label'] for v in latex_results.keys()])
+    header2 = " & ".join([""] + [latex_results[v]['sublabel'] for v in latex_results.keys()])
+    latex_lines.append(header1 + r" \\")
+    latex_lines.append(header2 + r" \\")
+    latex_lines.append(" & " + " & ".join([f"({i+1})" for i in range(n_cols)]) + r" \\")
+    latex_lines.append(r"\midrule")
+
+    # Key coefficients to show (in order)
+    coef_labels = {
+        'mp_klms_U': r'$\omega$ (Shock)',
+        'omega_rank': r'$\omega \times Rank$',
+        'omega_VAR': r'$\omega \times Rate$',  # placeholder for omega_X
+        'omega_rank_VAR': r'$\omega \times Rank \times Rate$',  # placeholder for triple
+    }
+
+    # Row for each coefficient type
+    for coef_type in ['mp_klms_U', 'omega_rank', 'omega_VAR', 'omega_rank_VAR']:
+        coef_row = []
+        se_row = []
+
+        for var_name in latex_results.keys():
+            res = latex_results[var_name]['res']
+
+            # Determine actual coefficient name
+            if coef_type == 'omega_VAR':
+                actual_coef = f'omega_{var_name}'
+            elif coef_type == 'omega_rank_VAR':
+                actual_coef = f'omega_rank_{var_name}'
+            else:
+                actual_coef = coef_type
+
+            if actual_coef in res.params.index:
+                coef_str, se_str = format_coef(
+                    res.params[actual_coef],
+                    res.std_errors[actual_coef],
+                    res.pvalues[actual_coef]
+                )
+                coef_row.append(coef_str)
+                se_row.append(se_str)
+            else:
+                coef_row.append("")
+                se_row.append("")
+
+        # Get label
+        if coef_type == 'omega_VAR':
+            label = r'$\omega \times Rate$'
+        elif coef_type == 'omega_rank_VAR':
+            label = r'$\omega \times Rank \times Rate$'
+        else:
+            label = coef_labels[coef_type]
+
+        latex_lines.append(label + " & " + " & ".join(coef_row) + r" \\")
+        latex_lines.append(" & " + " & ".join(se_row) + r" \\[0.5em]")
+
+    latex_lines.append(r"\midrule")
+
+    # N and R2 rows
+    n_row = "Observations & " + " & ".join([f"{latex_results[v]['n']:,}" for v in latex_results.keys()]) + r" \\"
+    r2_row = r"$R^2$ & " + " & ".join([f"{latex_results[v]['r2']:.4f}" for v in latex_results.keys()]) + r" \\"
+    latex_lines.append(n_row)
+    latex_lines.append(r2_row)
+
+    # Footer
+    latex_lines.extend([
+        r"\midrule",
+        r"Firm FE & " + " & ".join(["Yes"] * n_cols) + r" \\",
+        r"Clustered SE & " + " & ".join(["Date"] * n_cols) + r" \\",
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\begin{tablenotes}[flushleft]",
+        r"\footnotesize",
+        r"\item Notes: Dependent variable is 30-minute stock return around FOMC announcements. ",
+        r"$\omega$ is the monetary policy shock. Rank is the firm's percentile by average market value percentile. ",
+        r"Columns (1)-(2) use POST dummies; columns (3)-(6) use continuous rate measures. ",
+        r"Standard errors clustered by FOMC date in parentheses. ",
+        r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
+        r"\end{tablenotes}",
+        r"\end{table}",
+    ])
+
+    # Save LaTeX table
+    latex_file = output_tab / "table_hf_robustness.tex"
+    with open(latex_file, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(latex_lines))
+    print(f"\nLaTeX table saved to: {latex_file}")
+
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE")
     print("="*80)
@@ -1124,7 +1284,7 @@ print("="*80)
 if 'window_shock_hf_30min' not in df_work.columns:
     print("ERROR: 'window_shock_hf_30min' not found in data. Cannot run window length robustness.")
 else:
-    rate_var = 'target_ma5_forward'  # Using 5-year forward MA rate for this robustness check
+    rate_var = 'synthetic_10y_rate'  # Using synthetic 10Y expected rate for this robustness check
 
     if rate_var not in df_work.columns:
         print(f"ERROR: '{rate_var}' not found. Cannot run window length robustness.")
@@ -1273,33 +1433,118 @@ else:
             print("\nTriple Interaction Coefficient (omega * rank * rate):")
             print(wl_summary_df.to_string(index=False))
 
-            # Save to CSV
-            wl_output_file = output_tab / "table_wl_robustness_ma3.csv"
-            wl_summary_df.to_csv(wl_output_file, index=False)
-            print(f"\nWindow length robustness table saved to: {wl_output_file}")
+            # ================================================================
+            # Generate LaTeX table for window length robustness
+            # ================================================================
+            def format_coef_wl(coef, se, pval):
+                """Format coefficient with stars and SE in parentheses"""
+                stars = '***' if pval < 0.01 else '**' if pval < 0.05 else '*' if pval < 0.10 else ''
+                return f"{coef:.4f}{stars}", f"({se:.4f})"
 
-            # Save detailed output
-            wl_detail_file = output_tab / "table_wl_robustness_ma3_detailed.txt"
-            with open(wl_detail_file, 'w', encoding='utf-8') as f:
-                f.write("="*80 + "\n")
-                f.write("WINDOW LENGTH ROBUSTNESS TABLE - DETAILED OUTPUT\n")
-                f.write(f"Rate Variable: {rate_var}\n")
-                f.write("="*80 + "\n\n")
+            # Column headers (two rows for cleaner display)
+            wl_col_labels_row1 = [
+                'Baseline',
+                '+WL',
+                '+WL',
+                '+WL',
+                '+WL',
+                'Drop',
+                'Drop',
+                'Drop',
+            ]
+            wl_col_labels_row2 = [
+                '',
+                'WLxShock',
+                'WLxRate',
+                'WLxRank',
+                'WLxTriple',
+                '$>$p90',
+                '$>$p75',
+                '$>$p50',
+            ]
 
-                f.write(f"Window length percentiles:\n")
-                f.write(f"   p50 = {wl_p50:.1f} min\n")
-                f.write(f"   p75 = {wl_p75:.1f} min\n")
-                f.write(f"   p90 = {wl_p90:.1f} min\n\n")
+            n_wl_cols = len(wl_results)
+            wl_col_align = 'l' + 'c' * n_wl_cols
 
-                for spec_name, spec_data in wl_results.items():
-                    f.write(f"\n{'='*60}\n")
-                    f.write(f"{spec_name}\n")
-                    f.write(f"Controls: {spec_data['controls']}\n")
-                    f.write(f"{'='*60}\n")
-                    f.write(spec_data['res'].summary.as_text())
-                    f.write("\n\n")
+            wl_latex_lines = [
+                r"\begin{table}[htbp]",
+                r"\centering",
+                r"\caption{Window Length Robustness}",
+                r"\label{tab:wl_robustness}",
+                r"\begin{tabular}{" + wl_col_align + "}",
+                r"\toprule",
+            ]
 
-            print(f"Detailed results saved to: {wl_detail_file}")
+            # Header rows
+            wl_header1 = " & ".join([""] + wl_col_labels_row1[:n_wl_cols])
+            wl_header2 = " & ".join([""] + wl_col_labels_row2[:n_wl_cols])
+            wl_latex_lines.append(wl_header1 + r" \\")
+            wl_latex_lines.append(wl_header2 + r" \\")
+            wl_latex_lines.append(" & " + " & ".join([f"({i+1})" for i in range(n_wl_cols)]) + r" \\")
+            wl_latex_lines.append(r"\midrule")
+
+            # Key coefficients to show
+            wl_coef_types = ['mp_klms_U', 'omega_rank', f'omega_{rate_var}', f'omega_rank_{rate_var}']
+            wl_coef_labels = {
+                'mp_klms_U': r'$\omega$ (Shock)',
+                'omega_rank': r'$\omega \times Rank$',
+                f'omega_{rate_var}': r'$\omega \times Rate$',
+                f'omega_rank_{rate_var}': r'$\omega \times Rank \times Rate$',
+            }
+
+            for coef_name in wl_coef_types:
+                coef_row = []
+                se_row = []
+
+                for spec_key in wl_results.keys():
+                    res = wl_results[spec_key]['res']
+                    if coef_name in res.params.index:
+                        coef_str, se_str = format_coef_wl(
+                            res.params[coef_name],
+                            res.std_errors[coef_name],
+                            res.pvalues[coef_name]
+                        )
+                        coef_row.append(coef_str)
+                        se_row.append(se_str)
+                    else:
+                        coef_row.append("")
+                        se_row.append("")
+
+                label = wl_coef_labels.get(coef_name, coef_name)
+                wl_latex_lines.append(label + " & " + " & ".join(coef_row) + r" \\")
+                wl_latex_lines.append(" & " + " & ".join(se_row) + r" \\[0.5em]")
+
+            wl_latex_lines.append(r"\midrule")
+
+            # N and R2 rows
+            wl_n_row = "Observations & " + " & ".join([f"{wl_results[k]['n']:,}" for k in wl_results.keys()]) + r" \\"
+            wl_r2_row = r"$R^2$ & " + " & ".join([f"{wl_results[k]['r2']:.4f}" for k in wl_results.keys()]) + r" \\"
+            wl_latex_lines.append(wl_n_row)
+            wl_latex_lines.append(wl_r2_row)
+
+            # Footer
+            wl_latex_lines.extend([
+                r"\midrule",
+                r"Firm FE & " + " & ".join(["Yes"] * n_wl_cols) + r" \\",
+                r"Clustered SE & " + " & ".join(["Date"] * n_wl_cols) + r" \\",
+                r"\bottomrule",
+                r"\end{tabular}",
+                r"\begin{tablenotes}[flushleft]",
+                r"\footnotesize",
+                r"\item Notes: Robustness to window length (WL) variation. Columns (1)-(5) progressively add WL controls and interactions. ",
+                f"Columns (6)-(8) drop observations with WL above p90 ({wl_p90:.0f}min), p75 ({wl_p75:.0f}min), and p50 ({wl_p50:.0f}min). ",
+                r"Rate variable is synthetic 10-year expected rate. ",
+                r"Standard errors clustered by FOMC date in parentheses. ",
+                r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
+                r"\end{tablenotes}",
+                r"\end{table}",
+            ])
+
+            # Save LaTeX table
+            wl_latex_file = output_tab / "table_wl_robustness.tex"
+            with open(wl_latex_file, 'w', encoding='utf-8') as f:
+                f.write('\n'.join(wl_latex_lines))
+            print(f"\nWindow length robustness LaTeX table saved to: {wl_latex_file}")
 
 print("\n" + "="*80)
 print("WINDOW LENGTH ROBUSTNESS ANALYSIS COMPLETE")
@@ -1307,6 +1552,423 @@ print("="*80)
 
 
 
+#### New section: A few figures to visualize
+
+#%%
+# ============================================================================
+# FIGURE 1: Treatment Effect by ptile_consis Ventile, Split by 10Y Synthetic Rate
+# ============================================================================
+# This figure shows how the treatment effect varies across the ptile_consis
+# distribution, separately for periods when the 10Y synthetic rate is above vs below median.
+
+print("\n" + "="*80)
+print("VISUALIZATION: Treatment Effect by ptile_consis Ventile")
+print("="*80)
+
+# Compute firm-level ptile_consis tag (using the mode/most common value per permno)
+print("\n[1/4] Computing firm-level ptile_consis tags...")
+firm_ptile = df_work.groupby('permno')['ptile_consis'].agg(lambda x: x.mode().iloc[0] if len(x.mode()) > 0 else x.median())
+firm_ptile = firm_ptile.reset_index()
+firm_ptile.columns = ['permno', 'firm_ptile_consis']
+
+# Compute ventiles (5, 10, 15, ..., 100) based on firm-level ptile_consis
+ventile_breaks = [0, 5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
+firm_ptile['ventile'] = pd.cut(
+    firm_ptile['firm_ptile_consis'] * 100,  # Convert to percentile scale
+    bins=ventile_breaks,
+    labels=[f'{v}' for v in ventile_breaks[1:]],
+    include_lowest=True
+)
+firm_ptile['ventile_num'] = firm_ptile['ventile'].astype(float)
+
+print(f"   Firms per ventile:")
+print(firm_ptile['ventile'].value_counts().sort_index())
+
+# Merge ventile tags back to main data
+df_viz = df_work.merge(firm_ptile[['permno', 'ventile', 'ventile_num']], on='permno', how='left')
+
+# Split by 10Y synthetic rate median
+print("\n[2/4] Splitting sample by 10Y synthetic rate median...")
+if 'synthetic_10y_rate' in df_viz.columns:
+    rate_var = 'synthetic_10y_rate'
+elif 'target_ma10_forward' in df_viz.columns:
+    rate_var = 'target_ma10_forward'
+    print(f"   WARNING: Using {rate_var} as fallback (synthetic_10y_rate not available)")
+else:
+    rate_var = 'target_ma5_forward'
+    print(f"   WARNING: Using {rate_var} as fallback")
+
+rate_median = df_viz[rate_var].median()
+print(f"   Using rate variable: {rate_var}")
+print(f"   Median rate: {rate_median:.3f}")
+
+df_viz['high_rate'] = (df_viz[rate_var] >= rate_median).astype(int)
+print(f"   High rate periods: {df_viz['high_rate'].sum():,} obs")
+print(f"   Low rate periods: {(1 - df_viz['high_rate']).sum():,} obs")
+
+# Run regressions for each ventile within each rate regime
+print("\n[3/4] Running regressions by ventile and rate regime...")
+
+def run_ventile_regression(df_sub, ventile_val, quiet=False):
+    """
+    Run a simple specification on a subset of data for a given ventile.
+
+    Model: shock_hf_30min = α_i + β * mp_klms_U + ε
+
+    With firm (permno) fixed effects and cluster(daten) standard errors.
+    Returns the coefficient β on mp_klms_U.
+    """
+    df_v = df_sub[df_sub['ventile_num'] == ventile_val].copy()
+
+    if len(df_v) < 100:
+        if not quiet:
+            print(f"      Ventile {ventile_val}: insufficient obs before dropna ({len(df_v)})")
+        return np.nan, np.nan, 0
+
+    # Drop missing values
+    key_vars = ['shock_hf_30min', 'mp_klms_U', 'permno', 'daten']
+    df_v = df_v.dropna(subset=key_vars)
+
+    if len(df_v) < 100:
+        if not quiet:
+            print(f"      Ventile {ventile_val}: insufficient obs after dropna ({len(df_v)})")
+        return np.nan, np.nan, 0
+
+    # Set panel index
+    df_v = df_v.set_index(['permno', 'daten'])
+
+    # Simple specification: just mp_klms_U on shock_hf_30min with firm FE
+    y = df_v['shock_hf_30min']
+    X = df_v[['mp_klms_U']]
+
+    try:
+        mod = PanelOLS(y, X, entity_effects=True, drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_time=True)
+
+        # Extract the coefficient on mp_klms_U
+        coef = res.params['mp_klms_U']
+        se = res.std_errors['mp_klms_U']
+        n = res.nobs
+
+        return coef, se, n
+    except Exception as e:
+        if not quiet:
+            print(f"      Error in ventile {ventile_val}: {e}")
+        return np.nan, np.nan, 0
+
+# Store results
+results_high = {'ventile': [], 'coef': [], 'se': [], 'n': []}
+results_low = {'ventile': [], 'coef': [], 'se': [], 'n': []}
+
+ventiles = [5, 10, 15, 20, 25, 30, 35, 40, 45, 50, 55, 60, 65, 70, 75, 80, 85, 90, 95, 100]
+
+# High rate regime
+print("   Running for HIGH rate regime...")
+df_high = df_viz[df_viz['high_rate'] == 1]
+for v in ventiles:
+    coef, se, n = run_ventile_regression(df_high, v)
+    results_high['ventile'].append(v)
+    results_high['coef'].append(coef)
+    results_high['se'].append(se)
+    results_high['n'].append(n)
+    if not np.isnan(coef):
+        print(f"      Ventile {v:3d}: coef = {coef:8.4f}, SE = {se:.4f}, N = {n:,}")
+
+# Low rate regime
+print("   Running for LOW rate regime...")
+df_low = df_viz[df_viz['high_rate'] == 0]
+for v in ventiles:
+    coef, se, n = run_ventile_regression(df_low, v)
+    results_low['ventile'].append(v)
+    results_low['coef'].append(coef)
+    results_low['se'].append(se)
+    results_low['n'].append(n)
+    if not np.isnan(coef):
+        print(f"      Ventile {v:3d}: coef = {coef:8.4f}, SE = {se:.4f}, N = {n:,}")
+
+# Convert to DataFrames
+df_results_high = pd.DataFrame(results_high)
+df_results_low = pd.DataFrame(results_low)
+
+# Create figure
+print("\n[4/4] Creating figure...")
+fig, axes = plt.subplots(1, 2, figsize=(14, 6), sharey=True)
+
+# High rate panel
+ax = axes[0]
+mask_high = ~df_results_high['coef'].isna()
+if mask_high.any():
+    x_high = df_results_high.loc[mask_high, 'ventile'].values
+    y_high = df_results_high.loc[mask_high, 'coef'].values
+    se_high = df_results_high.loc[mask_high, 'se'].values
+
+    # Plot points with error bars (no connecting line)
+    ax.errorbar(x_high, y_high, yerr=se_high,
+                fmt='o', color='darkred', capsize=3, capthick=1, markersize=6,
+                label='Point estimate ± 1 SE')
+
+    # Fit and plot regression line
+    slope_high, intercept_high = np.polyfit(x_high, y_high, 1)
+    x_fit = np.linspace(min(x_high), max(x_high), 100)
+    ax.plot(x_fit, slope_high * x_fit + intercept_high,
+            color='darkred', linewidth=2, linestyle='-', alpha=0.7,
+            label=f'Fit: slope = {slope_high:.4f}')
+
+ax.axhline(y=0, color='black', linewidth=0.5, linestyle='--')
+ax.set_xlabel('ptile_consis Ventile (Firm-Level)', fontsize=11)
+ax.set_ylabel(r'Coefficient on $\omega$ (mp_klms_U)', fontsize=11)
+ax.set_title(f'HIGH Rate Regime\n({rate_var} ≥ {rate_median:.2f})', fontsize=12)
+ax.set_xticks(ventiles)
+ax.set_xticklabels([str(v) for v in ventiles], rotation=45)
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=9)
+
+# Low rate panel
+ax = axes[1]
+mask_low = ~df_results_low['coef'].isna()
+if mask_low.any():
+    x_low = df_results_low.loc[mask_low, 'ventile'].values
+    y_low = df_results_low.loc[mask_low, 'coef'].values
+    se_low = df_results_low.loc[mask_low, 'se'].values
+
+    # Plot points with error bars (no connecting line)
+    ax.errorbar(x_low, y_low, yerr=se_low,
+                fmt='o', color='darkblue', capsize=3, capthick=1, markersize=6,
+                label='Point estimate ± 1 SE')
+
+    # Fit and plot regression line
+    slope_low, intercept_low = np.polyfit(x_low, y_low, 1)
+    x_fit = np.linspace(min(x_low), max(x_low), 100)
+    ax.plot(x_fit, slope_low * x_fit + intercept_low,
+            color='darkblue', linewidth=2, linestyle='-', alpha=0.7,
+            label=f'Fit: slope = {slope_low:.4f}')
+
+ax.axhline(y=0, color='black', linewidth=0.5, linestyle='--')
+ax.set_xlabel('ptile_consis Ventile (Firm-Level)', fontsize=11)
+ax.set_title(f'LOW Rate Regime\n({rate_var} < {rate_median:.2f})', fontsize=12)
+ax.set_xticks(ventiles)
+ax.set_xticklabels([str(v) for v in ventiles], rotation=45)
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=9)
+
+plt.suptitle('Treatment Effect by Firm ptile_consis Ventile, Split by 10Y Synthetic Rate', fontsize=14, y=1.02)
+plt.tight_layout()
+
+# Save figure
+fig_path = sandbox_data_path.parent / 'figure_ventile_by_rate.png'
+plt.savefig(fig_path, dpi=150, bbox_inches='tight')
+print(f"\nFigure saved to: {fig_path}")
+plt.close()
+
+# Also create an overlay version
+fig, ax = plt.subplots(figsize=(10, 6))
+
+if mask_high.any():
+    # Plot points with error bars (no connecting line)
+    ax.errorbar(x_high - 0.5, y_high, yerr=se_high,
+                fmt='o', color='darkred', capsize=3, capthick=1, markersize=6,
+                label=f'High Rate (≥ {rate_median:.2f})')
+
+    # Plot regression line
+    ax.plot(x_fit, slope_high * x_fit + intercept_high,
+            color='darkred', linewidth=2, linestyle='-', alpha=0.7)
+
+if mask_low.any():
+    # Plot points with error bars (no connecting line)
+    ax.errorbar(x_low + 0.5, y_low, yerr=se_low,
+                fmt='s', color='darkblue', capsize=3, capthick=1, markersize=6,
+                label=f'Low Rate (< {rate_median:.2f})')
+
+    # Plot regression line
+    ax.plot(x_fit, slope_low * x_fit + intercept_low,
+            color='darkblue', linewidth=2, linestyle='-', alpha=0.7)
+
+ax.axhline(y=0, color='black', linewidth=0.5, linestyle='--')
+ax.set_xlabel('ptile_consis Ventile (Firm-Level)', fontsize=11)
+ax.set_ylabel(r'Coefficient on $\omega$ (mp_klms_U)', fontsize=11)
+ax.set_title(f'MP Pass-Through by Firm ptile_consis Ventile\nSplit by {rate_var}', fontsize=12)
+ax.set_xticks(ventiles)
+ax.set_xticklabels([str(v) for v in ventiles], rotation=45)
+ax.grid(True, alpha=0.3)
+ax.legend(loc='best', fontsize=10)
+
+plt.tight_layout()
+fig_overlay_path = sandbox_data_path.parent / 'figure_ventile_by_rate_overlay.png'
+plt.savefig(fig_overlay_path, dpi=150, bbox_inches='tight')
+print(f"Overlay figure saved to: {fig_overlay_path}")
+plt.close()
+
+print("\nVENTILE VISUALIZATION COMPLETE")
+
+
+
+
+
+
+
+
+
+#### Gemini suggestions for figures to try: 
+
+# ============================================================================
+# GEMINI SUGGESTIONS
+# ============================================================================
+#%%
+# Define sandbox output path
+gemini_output_path = base_path / "FRRS_data" / "sandbox_jan2026"
+gemini_output_path.mkdir(parents=True, exist_ok=True)
+print(f"Gemini figures will be saved to: {gemini_output_path}")
+
+#%%
+# 1. Rate-Bin Sensitivity Plot
+# Does the interaction coefficient (mp_klms_U * ptile_consis) increase with the rate level?
+
+# print("\n[Gemini] Creating Rate-Bin Sensitivity Plot...")
+
+# # Define rate bins (deciles of the rate)
+# n_bins = 10
+# if 'rate_var' not in locals():
+#     #  rate_var = 'target_ma5_forward' # Fallback
+#     rate_var = 'synthetic_10y_rate'
+     
+# # Use df_viz from previous block
+# df_robust = df_viz.copy()
+
+# # Create bins based on unique dates to ensure each meeting is in one bin
+# unique_dates = df_robust[['daten', rate_var]].drop_duplicates()
+# unique_dates['rate_bin'] = pd.qcut(unique_dates[rate_var], n_bins, labels=False)
+
+# # Merge bins back
+# df_robust = df_robust.merge(unique_dates[['daten', 'rate_bin']], on='daten', how='left')
+
+# bin_coefs = []
+# bin_ses = []
+# bin_rates = []
+
+# print(f"   Using {rate_var} for {n_bins} bins")
+
+# for b in range(n_bins):
+#     df_bin = df_robust[df_robust['rate_bin'] == b].copy()
+    
+#     # Calculate average rate in this bin
+#     avg_rate = df_bin[rate_var].mean()
+#     bin_rates.append(avg_rate)
+    
+#     # Run regression: shock_hf_30min ~ mp_klms_U * ptile_consis + Fixed Effects
+#     # We want the interaction term.
+    
+#     df_bin['interaction'] = df_bin['mp_klms_U'] * df_bin['ptile_consis']
+    
+#     if df_bin['ptile_consis'].nunique() <= 1:
+#         print(f"      Bin {b}: Insufficient variation in ptile")
+#         bin_coefs.append(np.nan)
+#         bin_ses.append(np.nan)
+#         continue
+        
+#     df_bin = df_bin.set_index(['permno', 'daten'])
+    
+#     # Model: shock ~ interaction + Firm FE + Time FE
+#     y = df_bin['shock_hf_30min']
+#     exog = df_bin[['interaction']]
+    
+#     try:
+#         mod = PanelOLS(y, exog, entity_effects=True, time_effects=True, drop_absorbed=True)
+#         res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+        
+#         bin_coefs.append(res.params['interaction'])
+#         bin_ses.append(res.std_errors['interaction'])
+#         print(f"      Bin {b} (Rate ~ {avg_rate:.2f}): Coef = {res.params['interaction']:.4f}")
+#     except Exception as e:
+#         print(f"      Bin {b} error: {e}")
+#         bin_coefs.append(np.nan)
+#         bin_ses.append(np.nan)
+
+# # Plot
+# plt.figure(figsize=(10, 6))
+# plt.errorbar(bin_rates, bin_coefs, yerr=bin_ses, fmt='o-', capsize=5, ecolor='gray', color='darkblue')
+# plt.axhline(0, color='black', linestyle='--', alpha=0.5)
+# plt.title(f'Mechanism Strength vs. Interest Rate Level\n(Coef on MP Shock × Firm Sensitivity by {rate_var} Deciles)')
+# plt.xlabel(f'Average Interest Rate ({rate_var})')
+# plt.ylabel('Interaction Coefficient')
+# plt.grid(True, alpha=0.3)
+# plt.tight_layout()
+# plt.savefig(gemini_output_path / 'gemini_mechanism_by_rate_level.png')
+# plt.close()
+
+
+#%%
+# 2. Rolling Interaction Coefficient
+# 5-Year rolling window of the interaction coefficient
+
+# print("\n[Gemini] Creating Rolling Interaction Plot...")
+# df_robust = df_viz.copy()
+# # Sliding window of dates
+# dates = sorted(df_robust['daten'].unique())
+# window_size = 40 # Approx 2.5 years (8 meetings/year)
+# step = 4
+
+# rolling_dates = []
+# rolling_coefs = []
+# rolling_ses = []
+# rolling_rates = []
+
+# for i in range(0, len(dates) - window_size, step):
+#     window_dates = dates[i : i+window_size]
+#     center_date_val = dates[i + window_size // 2]
+    
+#     df_window = df_robust[df_robust['daten'].isin(window_dates)].copy()
+    
+#     # Avg rate in window
+#     avg_rate_window = df_window[rate_var].mean()
+    
+#     df_window['interaction'] = df_window['mp_klms_U'] * df_window['ptile_consis']
+#     df_window = df_window.set_index(['permno', 'daten'])
+    
+#     try:
+#         mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']], 
+#                        entity_effects=True, time_effects=True, drop_absorbed=True)
+#         res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+        
+#         rolling_coefs.append(res.params['interaction'])
+#         rolling_ses.append(res.std_errors['interaction'])
+#         rolling_rates.append(avg_rate_window)
+#         rolling_dates.append(center_date_val)
+        
+#     except:
+#         rolling_coefs.append(np.nan)
+#         rolling_ses.append(np.nan)
+#         rolling_rates.append(np.nan)
+#         rolling_dates.append(center_date_val)
+
+# # Convert Stata dates to Python dates for plotting
+# base_date = pd.Timestamp('1960-01-01')
+# try:
+#     plot_dates = [base_date + pd.Timedelta(days=int(d)) for d in rolling_dates]
+# except:
+#     plot_dates = rolling_dates
+
+# # Dual Axis Plot
+# fig, ax1 = plt.subplots(figsize=(12, 6))
+
+# color = 'tab:blue'
+# ax1.set_xlabel('Date')
+# ax1.set_ylabel('Interaction Coefficient (Mechanism Strength)', color=color)
+# ax1.plot(plot_dates, rolling_coefs, color=color, linewidth=2, label='Interaction Coef')
+# ax1.tick_params(axis='y', labelcolor=color)
+# ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+
+# ax2 = ax1.twinx()  
+# color = 'tab:red'
+# ax2.set_ylabel(f'Interest Rate ({rate_var})', color=color)  
+# ax2.plot(plot_dates, rolling_rates, color=color, linestyle=':', linewidth=2, alpha=0.7, label='Interest Rate')
+# ax2.tick_params(axis='y', labelcolor=color)
+
+# plt.title('Time-Varying Mechanism Strength vs. Interest Rates')
+# plt.tight_layout()
+# plt.savefig(gemini_output_path / 'gemini_rolling_mechanism.png')
+# plt.close()
+
+# print("Gemini figures generated.")
 
 
 
@@ -1324,11 +1986,85 @@ print("="*80)
 
 
 
+# %%
+# Try 10 year rolling window 
+
+# 2. Rolling Interaction Coefficient
+# 10-Year rolling window of the interaction coefficient
+
+print("\n[Gemini] Creating Rolling Interaction Plot...")
+df_robust = df_viz.copy()
+# Sliding window of dates
+dates = sorted(df_robust['daten'].unique())
+window_size = 80 # Approx 10 years (8 meetings/year)
+step = 10
+
+rolling_dates = []
+rolling_coefs = []
+rolling_ses = []
+rolling_rates = []
+
+for i in range(0, len(dates) - window_size, step):
+    window_dates = dates[i : i+window_size]
+    date_val = dates[i + window_size // 2]
+    
+    df_window = df_robust[df_robust['daten'].isin(window_dates)].copy()
+    
+    # Avg rate in window -- NO! Actual rate at date 
+    avg_rate_window = df_robust[df_robust['daten'] == date_val][rate_var].mean()
+    
+    df_window['interaction'] = df_window['mp_klms_U'] * df_window['ptile_consis']
+    df_window = df_window.set_index(['permno', 'daten'])
+    
+    try:
+        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']], 
+                       entity_effects=True, time_effects=True, drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
+        
+        rolling_coefs.append(res.params['interaction'])
+        rolling_ses.append(res.std_errors['interaction'])
+        rolling_rates.append(avg_rate_window)
+        rolling_dates.append(date_val)
+        
+    except:
+        rolling_coefs.append(np.nan)
+        rolling_ses.append(np.nan)
+        rolling_rates.append(np.nan)
+        rolling_dates.append(date_val)
+
+# Convert Stata dates to Python dates for plotting
+base_date = pd.Timestamp('1960-01-01')
+try:
+    plot_dates = [base_date + pd.Timedelta(days=int(d)) for d in rolling_dates]
+except:
+    plot_dates = rolling_dates
+
+# Dual Axis Plot
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+color = 'tab:blue'
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Interaction Coefficient (Mechanism Strength)', color=color)
+ax1.plot(plot_dates, rolling_coefs, color=color, linewidth=2, label='Interaction Coef')
+ax1.tick_params(axis='y', labelcolor=color)
+ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+
+ax2 = ax1.twinx()  
+color = 'tab:red'
+ax2.set_ylabel(f'Interest Rate ({rate_var})', color=color)  
+ax2.plot(plot_dates, rolling_rates, color=color, linestyle=':', linewidth=2, alpha=0.7, label='Interest Rate')
+ax2.tick_params(axis='y', labelcolor=color)
+
+plt.title('Time-Varying Mechanism Strength vs. Interest Rates')
+plt.tight_layout()
+plt.savefig(gemini_output_path / 'gemini_rolling_mechanism.png')
+plt.close()
+
+print("Gemini figures generated.")
 
 
 
 
 
 
-
-
+# %%
