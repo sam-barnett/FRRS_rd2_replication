@@ -22,6 +22,7 @@ from linearmodels.panel import PanelOLS
 import matplotlib.pyplot as plt
 from pathlib import Path
 import warnings
+import gc  # For memory cleanup
 warnings.filterwarnings('ignore')
 
 # ============================================================================
@@ -76,13 +77,16 @@ df_fomc_timing['date'] = df_fomc_timing['daten'].apply(stata_to_date)
 # Load ED contract mapping
 ed_mapping_file = data_path / "highfreq" / "proc" / "fomc_hour_bonds_eurodollar_14_24.dta"
 df_ed_map, _ = pyreadstat.read_dta(str(ed_mapping_file))
-# Merge mapping into timing/main dataframe
-# Look for common columns to merge on, or daten/fomc_id
-# usually date is enough
+# Merge mapping into timing/main dataframe (quarter_X_ahead columns for ED contract mapping)
+ed_map_cols = ['daten', 'quarter_1_ahead', 'quarter_2_ahead', 'quarter_3_ahead']
 df_fomc_info = df_fomc_timing.merge(
-    df_ed_map[['daten', 'quarter_1_ahead', 'quarter_2_ahead', 'quarter_3_ahead']], 
+    df_ed_map[ed_map_cols],
     on='daten', how='left'
 )
+
+# Cleanup: df_fomc_timing and df_ed_map no longer needed
+del df_fomc_timing, df_ed_map
+gc.collect()
 
 # Get list of FOMC dates (in Stata format) for filtering
 fomc_dates_stata = set(df_fomc_info['daten'].dropna().astype(int).tolist())
@@ -125,6 +129,9 @@ try:
     
     if ed_shards:
         df_ed = pd.concat(ed_shards, ignore_index=True)
+        # Cleanup: ed_shards no longer needed
+        del ed_shards
+        gc.collect()
         # Convert close to rate
         if 'close' in df_ed.columns:
              df_ed['rate'] = 100 - df_ed['close']
@@ -132,7 +139,27 @@ try:
         # Ensure exp_quarter is int for matching
         if 'exp_quarter' in df_ed.columns:
             df_ed['exp_quarter'] = df_ed['exp_quarter'].astype(int)
-        print(f"\n   - Loaded ED futures: {len(df_ed):,} obs on FOMC dates")
+        # Ensure sofr column is int for proper filtering (ED=0, SOFR=1)
+        if 'sofr' in df_ed.columns:
+            df_ed['sofr'] = df_ed['sofr'].fillna(0).astype(int)
+            n_before = len(df_ed)
+            n_ed_before = (df_ed['sofr'] == 0).sum()
+            n_sofr_before = (df_ed['sofr'] == 1).sum()
+
+            # Drop ED contracts (sofr==0) for 2022+ and SOFR contracts (sofr==1) for pre-2022
+            # This mirrors the Stata logic: drop if yofd(daten) >= 2022 & sofr == 0
+            #                               drop if yofd(daten) < 2022 & sofr == 1
+            df_ed['year'] = df_ed['date'].dt.year
+            df_ed = df_ed[~((df_ed['year'] >= 2022) & (df_ed['sofr'] == 0))]  # Drop ED in 2022+
+            df_ed = df_ed[~((df_ed['year'] < 2022) & (df_ed['sofr'] == 1))]   # Drop SOFR pre-2022
+            df_ed = df_ed.drop(columns=['year'])
+
+            n_after = len(df_ed)
+            print(f"\n   - Loaded ED/SOFR futures: {n_before:,} obs (ED: {n_ed_before:,}, SOFR: {n_sofr_before:,})")
+            print(f"     After ED/SOFR date filter: {n_after:,} obs (dropped {n_before - n_after:,})")
+        else:
+            print(f"\n   - Loaded ED futures: {len(df_ed):,} obs on FOMC dates")
+            print(f"     WARNING: 'sofr' column not found - ED/SOFR filtering will NOT work!")
     else:
         print("\n   - WARNING: No matching ED futures data found")
         df_ed = pd.DataFrame()
@@ -199,7 +226,12 @@ def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filt
     pre_shock = day_data[day_data['trade_min'] < cutoff_min]
 
     if len(pre_shock) == 0:
-        return np.nan
+        # No trades before cutoff - fall back to last trade on that day
+        # Only fail if there are no trades on the day at all
+        if len(day_data) == 0:
+            return np.nan
+        day_data = day_data.sort_values('trade_min')
+        return day_data.iloc[-1][value_col]
 
     # Return the last pre-shock value
     # sort by trade_min to be sure we get the last one
@@ -223,10 +255,10 @@ for idx, row in df_fomc_info.iterrows():
     fomc_date = row['date']
     fomc_hour = row['hour']
     fomc_minute = row['minute']
-    
+
     # Needs for FF
     current_month = row['current_month']
-    
+
     # Needs for ED (ED2, ED3, ED4 maps to q1, q2, q3 ahead)
     ed2_q = row['quarter_1_ahead']
     ed3_q = row['quarter_2_ahead']
@@ -238,12 +270,12 @@ for idx, row in df_fomc_info.iterrows():
 
     # 1. FF1 (Current Month)
     r_ff1 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month')
-    
+
     # 2. FF2 (Next Month)
     next_month = int(current_month) + 1
     r_ff2 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month')
 
-    # 3. ED2, ED3, ED4
+    # 3. ED2, ED3, ED4 (df_ed is pre-filtered to have ED pre-2022 and SOFR 2022+)
     r_ed2 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed2_q, 'exp_quarter')
     r_ed3 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed3_q, 'exp_quarter')
     r_ed4 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed4_q, 'exp_quarter')
@@ -309,6 +341,10 @@ if n_valid > 0:
 if 'synthetic_1y_rate' in df.columns:
     df = df.drop(columns=['synthetic_1y_rate'])
 df = df.merge(df_synthetic[['daten', 'synthetic_1y_rate']], on='daten', how='left')
+
+# Cleanup: synthetic_rates list and df_synthetic no longer needed
+del synthetic_rates, df_synthetic
+gc.collect()
 
 # ============================================================================
 # CONSTRUCT SYNTHETIC 10Y EXPECTED RATE
@@ -385,6 +421,7 @@ for idx, row in df_fomc_info.iterrows():
     r_ff1 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month')
     next_month = int(current_month) + 1
     r_ff2 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month')
+    # ED2-4 (df_ed is pre-filtered to have ED pre-2022 and SOFR 2022+)
     r_ed2 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed2_q, 'exp_quarter')
     r_ed3 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed3_q, 'exp_quarter')
     r_ed4 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed4_q, 'exp_quarter')
@@ -497,6 +534,20 @@ for col in ['synthetic_5y_rate', 'synthetic_10y_rate']:
         df = df.drop(columns=[col])
 df = df.merge(df_synthetic_10y[['daten', 'synthetic_5y_rate', 'synthetic_10y_rate']], on='daten', how='left')
 
+# Cleanup: High-frequency futures and bond data no longer needed
+print("\n   Cleaning up high-frequency data from memory...")
+del synthetic_10y_rates, df_synthetic_10y
+if 'df_bonds' in dir() and df_bonds is not None:
+    del df_bonds
+if 'df_ff' in dir():
+    del df_ff
+if 'df_ed' in dir():
+    del df_ed
+if 'df_fomc_info' in dir():
+    del df_fomc_info
+gc.collect()
+print("   - Memory cleanup complete")
+
 # ============================================================================
 # LINEARLY INTERPOLATE MISSING SYNTHETIC RATES (at FOMC-date level)
 # ============================================================================
@@ -607,6 +658,12 @@ try:
         
 except Exception as e:
     print(f"   - ERROR constructing rate expectations: {e}")
+
+# Cleanup: FRED dataframes no longer needed
+for var_name in ['df_dgs2', 'df_3mo', 'df_spr', 'df_tp']:
+    if var_name in dir():
+        exec(f'del {var_name}')
+gc.collect()
 
 #%%
 # ============================================================================
@@ -740,6 +797,14 @@ else:
 # Store working dataframe
 df_work = df_sched.copy()
 
+# Cleanup: df_sched and original df no longer needed (df_work has all we need)
+print("\n   Cleaning up intermediate dataframes...")
+del df_sched
+if 'df' in dir():
+    del df
+gc.collect()
+print("   - Intermediate dataframes cleaned up")
+
 print(f"\n   Final working sample: {len(df_work):,} observations")
 
 # Save sandbox data for analysis
@@ -772,7 +837,7 @@ print(f"   - Columns: {existing_cols}")
 # ============================================================================
 
 def run_specification(df, post_var_name, spec_label, include_post_term=True,
-                      extra_controls=None, sample_filter=None, quiet=False):
+                      extra_controls=None, sample_filter=None, quiet=False, time_effects=False):
     """
     Run panel regression with firm FEs and clustered SEs
 
@@ -784,6 +849,8 @@ def run_specification(df, post_var_name, spec_label, include_post_term=True,
     - extra_controls: List of additional control variable names to include
     - sample_filter: Boolean mask to filter sample before regression
     - quiet: If True, suppress detailed output
+    - time_effects: If True, include time (date) fixed effects (TWFE).
+                    Note: This absorbs date-level variables (mp_klms_U, post_var, omega_post_var)
 
     Returns:
     - results object, sample size, R-squared
@@ -820,16 +887,25 @@ def run_specification(df, post_var_name, spec_label, include_post_term=True,
         df_reg['WLxTRIPLE'] = df_reg['window_shock_hf_30min'] * df_reg[f'omega_rank_{post_var_name}']
 
     # Specify exogenous variables
-    if include_post_term:
-        exog_vars = ['mp_klms_U', 'omega_rank', f'omega_{post_var_name}',
-                     f'omega_rank_{post_var_name}', post_var_name]
+    # With time_effects=True, date-level variables are absorbed, so only include firm×date level vars
+    if time_effects:
+        # Only variables that vary at firm×date level survive TWFE
+        exog_vars = ['omega_rank', f'omega_rank_{post_var_name}']
+        # Filter extra_controls to only those that survive TWFE
+        if extra_controls:
+            # WLxFPTILE and WLxTRIPLE survive (vary at firm×date); others are absorbed
+            twfe_safe_controls = ['WLxFPTILE', 'WLxTRIPLE']
+            exog_vars.extend([c for c in extra_controls if c in twfe_safe_controls])
     else:
-        exog_vars = ['mp_klms_U', 'omega_rank', f'omega_{post_var_name}',
-                     f'omega_rank_{post_var_name}']
-
-    # Add extra controls
-    if extra_controls:
-        exog_vars.extend(extra_controls)
+        if include_post_term:
+            exog_vars = ['mp_klms_U', 'omega_rank', f'omega_{post_var_name}',
+                         f'omega_rank_{post_var_name}', post_var_name]
+        else:
+            exog_vars = ['mp_klms_U', 'omega_rank', f'omega_{post_var_name}',
+                         f'omega_rank_{post_var_name}']
+        # Add extra controls
+        if extra_controls:
+            exog_vars.extend(extra_controls)
 
     # Set panel index (firm-date) - linearmodels requires MultiIndex with (entity, time)
     df_reg = df_reg.set_index(['permno', 'daten'])
@@ -838,8 +914,8 @@ def run_specification(df, post_var_name, spec_label, include_post_term=True,
     y = df_reg['shock_hf_30min']
     X = df_reg[exog_vars]
 
-    # Run panel OLS with firm fixed effects
-    mod = PanelOLS(y, X, entity_effects=True, drop_absorbed=True)
+    # Run panel OLS with firm fixed effects (and optionally time FE)
+    mod = PanelOLS(y, X, entity_effects=True, time_effects=time_effects, drop_absorbed=True)
 
     # Fit with clustered SEs at FOMC date level
     # For linearmodels, clusters should be passed as DataFrame/Series with matching index
@@ -863,6 +939,9 @@ def run_specification(df, post_var_name, spec_label, include_post_term=True,
             pval = res.pvalues[param]
             stars = '***' if pval < 0.01 else '**' if pval < 0.05 else '*' if pval < 0.10 else ''
             print(f"  {param:30s}: {coef:8.4f}{stars:3s}  (SE: {se:.4f}, p: {pval:.4f})")
+
+    # Cleanup: delete large intermediate objects
+    del df_reg, y, X, mod
 
     return res, n_obs, r2
 
@@ -1237,6 +1316,118 @@ if results_dict:
         f.write('\n'.join(latex_lines))
     print(f"\nLaTeX table saved to: {latex_file}")
 
+    # ========================================================================
+    # LATEX TABLE OUTPUT - TWFE (Two-Way Fixed Effects) Version
+    # ========================================================================
+    print("\n" + "="*80)
+    print("GENERATING TWFE LATEX TABLE")
+    print("="*80)
+
+    # Run specifications with time_effects=True and collect results
+    latex_results_twfe = {}
+    for var_name, col_label, col_sublabel in latex_specs:
+        if var_name in df_work.columns and df_work[var_name].notna().sum() > 100:
+            try:
+                res, n, r2 = run_specification(df_work, var_name, f'LaTeX TWFE: {var_name}',
+                                               quiet=True, time_effects=True)
+                latex_results_twfe[var_name] = {'res': res, 'n': n, 'r2': r2, 'label': col_label, 'sublabel': col_sublabel}
+                print(f"   {var_name}: N={n:,}, R2={r2:.4f}")
+            except Exception as e:
+                print(f"   {var_name}: ERROR - {e}")
+        else:
+            print(f"   {var_name}: SKIPPED (missing or insufficient data)")
+
+    # Build TWFE LaTeX table (only 2 coefficient rows: omega_rank and omega_rank_VAR)
+    n_cols_twfe = len(latex_results_twfe)
+    col_align_twfe = 'l' + 'c' * n_cols_twfe
+
+    latex_lines_twfe = [
+        r"\begin{table}[htbp]",
+        r"\centering",
+        r"\caption{High-Frequency Stock Response: Two-Way Fixed Effects}",
+        r"\label{tab:hf_robustness_twfe}",
+        r"\begin{tabular}{" + col_align_twfe + "}",
+        r"\toprule",
+    ]
+
+    # Header rows
+    header1_twfe = " & ".join([""] + [latex_results_twfe[v]['label'] for v in latex_results_twfe.keys()])
+    header2_twfe = " & ".join([""] + [latex_results_twfe[v]['sublabel'] for v in latex_results_twfe.keys()])
+    latex_lines_twfe.append(header1_twfe + r" \\")
+    latex_lines_twfe.append(header2_twfe + r" \\")
+    latex_lines_twfe.append(" & " + " & ".join([f"({i+1})" for i in range(n_cols_twfe)]) + r" \\")
+    latex_lines_twfe.append(r"\midrule")
+
+    # Only 2 coefficient rows for TWFE (variables that survive)
+    twfe_coef_types = ['omega_rank', 'omega_rank_VAR']
+
+    for coef_type in twfe_coef_types:
+        coef_row = []
+        se_row = []
+
+        for var_name in latex_results_twfe.keys():
+            res = latex_results_twfe[var_name]['res']
+
+            # Determine actual coefficient name
+            if coef_type == 'omega_rank_VAR':
+                actual_coef = f'omega_rank_{var_name}'
+            else:
+                actual_coef = coef_type
+
+            if actual_coef in res.params.index:
+                coef_str, se_str = format_coef(
+                    res.params[actual_coef],
+                    res.std_errors[actual_coef],
+                    res.pvalues[actual_coef]
+                )
+                coef_row.append(coef_str)
+                se_row.append(se_str)
+            else:
+                coef_row.append("")
+                se_row.append("")
+
+        # Get label
+        if coef_type == 'omega_rank':
+            label = r'$\omega \times Rank$'
+        else:
+            label = r'$\omega \times Rank \times Rate$'
+
+        latex_lines_twfe.append(label + " & " + " & ".join(coef_row) + r" \\")
+        latex_lines_twfe.append(" & " + " & ".join(se_row) + r" \\[0.5em]")
+
+    latex_lines_twfe.append(r"\midrule")
+
+    # N and R2 rows
+    n_row_twfe = "Observations & " + " & ".join([f"{latex_results_twfe[v]['n']:,}" for v in latex_results_twfe.keys()]) + r" \\"
+    r2_row_twfe = r"$R^2$ & " + " & ".join([f"{latex_results_twfe[v]['r2']:.4f}" for v in latex_results_twfe.keys()]) + r" \\"
+    latex_lines_twfe.append(n_row_twfe)
+    latex_lines_twfe.append(r2_row_twfe)
+
+    # Footer
+    latex_lines_twfe.extend([
+        r"\midrule",
+        r"Firm FE & " + " & ".join(["Yes"] * n_cols_twfe) + r" \\",
+        r"Time FE & " + " & ".join(["Yes"] * n_cols_twfe) + r" \\",
+        r"Clustered SE & " + " & ".join(["Date"] * n_cols_twfe) + r" \\",
+        r"\bottomrule",
+        r"\end{tabular}",
+        r"\begin{tablenotes}[flushleft]",
+        r"\footnotesize",
+        r"\item Notes: Two-way fixed effects specification (firm and time FE). ",
+        r"Date-level variables ($\omega$, Rate, $\omega \times Rate$) are absorbed by time FE. ",
+        r"Only interaction terms varying at firm$\times$date level are identified. ",
+        r"Standard errors clustered by FOMC date in parentheses. ",
+        r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
+        r"\end{tablenotes}",
+        r"\end{table}",
+    ])
+
+    # Save TWFE LaTeX table
+    latex_file_twfe = output_tab / "table_hf_robustness_twfe.tex"
+    with open(latex_file_twfe, 'w', encoding='utf-8') as f:
+        f.write('\n'.join(latex_lines_twfe))
+    print(f"\nTWFE LaTeX table saved to: {latex_file_twfe}")
+
     print("\n" + "="*80)
     print("ANALYSIS COMPLETE")
     print("="*80)
@@ -1245,7 +1436,75 @@ if results_dict:
 else:
     print("\nERROR: No specifications completed successfully")
 
+#%%
+# ============================================================================
+# TEST SPEC: TWFE WITH LAGGED FFR
+# ============================================================================
+# Simple test: Use lagged federal funds rate as the rate variable in TWFE
+# This tests whether the heterogeneous effect depends on past rate levels
+# ============================================================================
 
+print("\n" + "="*80)
+print("TEST SPECIFICATION: TWFE WITH LAGGED FFR")
+print("="*80)
+
+# Create lagged FFR at FOMC-date level
+if 'target' in df_work.columns:
+    print("\n   Creating lagged FFR variable...")
+
+    # Get unique FOMC dates with their target rates
+    fomc_rates = df_work[['daten', 'target']].drop_duplicates(subset=['daten']).sort_values('daten')
+
+    # Create lag (previous FOMC meeting's rate)
+    fomc_rates['target_lag'] = fomc_rates['target'].shift(1)
+
+    n_valid_lag = fomc_rates['target_lag'].notna().sum()
+    print(f"   - Created target_lag: {n_valid_lag}/{len(fomc_rates)} FOMC dates with valid lag")
+
+    # Merge back to main data
+    if 'target_lag' in df_work.columns:
+        df_work = df_work.drop(columns=['target_lag'])
+    df_work = df_work.merge(fomc_rates[['daten', 'target_lag']], on='daten', how='left')
+
+    print(f"   - Merged to main data: {df_work['target_lag'].notna().sum():,} obs with valid lagged FFR")
+
+    # Run TWFE specification with lagged FFR
+    print("\n   Running TWFE with lagged FFR...")
+    if df_work['target_lag'].notna().sum() > 0:
+        try:
+            res_lag, n_lag, r2_lag = run_specification(
+                df_work,
+                'target_lag',
+                'TEST: TWFE with Lagged FFR',
+                time_effects=True
+            )
+            print(f"\n   TEST RESULT: TWFE with Lagged FFR")
+            print(f"   N = {n_lag:,}, R² = {r2_lag:.4f}")
+
+            # Show key coefficients
+            print(f"\n   Key coefficients:")
+            for param in res_lag.params.index:
+                coef = res_lag.params[param]
+                se = res_lag.std_errors[param]
+                pval = res_lag.pvalues[param]
+                stars = '***' if pval < 0.01 else '**' if pval < 0.05 else '*' if pval < 0.10 else ''
+                print(f"     {param:30s}: {coef:8.4f}{stars:3s}  (SE: {se:.4f})")
+
+        except Exception as e:
+            print(f"   ERROR in TWFE with lagged FFR: {e}")
+    else:
+        print("   SKIPPED: No valid lagged FFR observations")
+else:
+    print("   SKIPPED: No target rate variable available")
+
+# Cleanup: Main table results no longer needed
+if 'results_dict' in dir():
+    del results_dict
+if 'latex_results' in dir():
+    del latex_results
+if 'latex_results_twfe' in dir():
+    del latex_results_twfe
+gc.collect()
 
 #### Alternative approach (for later) -- try controlling for ACMTP10, te Adian Crump Moench term premium. 
 
@@ -1546,11 +1805,217 @@ else:
                 f.write('\n'.join(wl_latex_lines))
             print(f"\nWindow length robustness LaTeX table saved to: {wl_latex_file}")
 
+            # ================================================================
+            # TWFE Window Length Robustness Table
+            # ================================================================
+            print("\n" + "="*80)
+            print("WINDOW LENGTH ROBUSTNESS - TWFE VERSION")
+            print("="*80)
+
+            wl_results_twfe = {}
+
+            # Column 1: Baseline (no WL controls) - TWFE
+            print("\n[WL-TWFE-1/8] Baseline (TWFE)...")
+            try:
+                res, n, r2 = run_specification(df_work, rate_var, 'WL TWFE Baseline', quiet=True, time_effects=True)
+                wl_results_twfe['(1) Baseline'] = {'res': res, 'n': n, 'r2': r2, 'controls': 'None'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 2: + WL controls (absorbed by TWFE, but run for consistency)
+            print("\n[WL-TWFE-2/8] +WL,WLxSHOCK (absorbed by time FE)...")
+            try:
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE +WLxSHOCK',
+                    extra_controls=['window_shock_hf_30min', 'WLxSHOCK'], quiet=True, time_effects=True
+                )
+                wl_results_twfe['(2) +WL,WLxSHOCK'] = {'res': res, 'n': n, 'r2': r2, 'controls': 'Absorbed'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 3: + WLxPOST (absorbed by TWFE)
+            print("\n[WL-TWFE-3/8] +WLxPOST (absorbed by time FE)...")
+            try:
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE +WLxPOST',
+                    extra_controls=['window_shock_hf_30min', 'WLxSHOCK', 'WLxPOST'], quiet=True, time_effects=True
+                )
+                wl_results_twfe['(3) +WLxPOST'] = {'res': res, 'n': n, 'r2': r2, 'controls': 'Absorbed'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 4: + WLxFPTILE (survives TWFE)
+            print("\n[WL-TWFE-4/8] +WLxFPTILE (survives TWFE)...")
+            try:
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE +WLxFPTILE',
+                    extra_controls=['window_shock_hf_30min', 'WLxSHOCK', 'WLxPOST', 'WLxFPTILE'], quiet=True, time_effects=True
+                )
+                wl_results_twfe['(4) +WLxFPTILE'] = {'res': res, 'n': n, 'r2': r2, 'controls': '+WLxFPTILE'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 5: + WLxTRIPLE (survives TWFE)
+            print("\n[WL-TWFE-5/8] +WLxTRIPLE (survives TWFE)...")
+            try:
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE +WLxTRIPLE',
+                    extra_controls=['window_shock_hf_30min', 'WLxSHOCK', 'WLxPOST', 'WLxFPTILE', 'WLxTRIPLE'], quiet=True, time_effects=True
+                )
+                wl_results_twfe['(5) +WLxTRIPLE'] = {'res': res, 'n': n, 'r2': r2, 'controls': '+WLxFPTILE,WLxTRIPLE'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 6: Drop WL > p90 - TWFE
+            print("\n[WL-TWFE-6/8] Drop WL > p90 (TWFE)...")
+            try:
+                sample_p90 = df_work['window_shock_hf_30min'] <= wl_p90
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE Drop>p90',
+                    sample_filter=sample_p90, quiet=True, time_effects=True
+                )
+                wl_results_twfe['(6) Drop>p90'] = {'res': res, 'n': n, 'r2': r2, 'controls': f'Drop WL>{wl_p90:.0f}min'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 7: Drop WL > p75 - TWFE
+            print("\n[WL-TWFE-7/8] Drop WL > p75 (TWFE)...")
+            try:
+                sample_p75 = df_work['window_shock_hf_30min'] <= wl_p75
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE Drop>p75',
+                    sample_filter=sample_p75, quiet=True, time_effects=True
+                )
+                wl_results_twfe['(7) Drop>p75'] = {'res': res, 'n': n, 'r2': r2, 'controls': f'Drop WL>{wl_p75:.0f}min'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Column 8: Drop WL > p50 - TWFE
+            print("\n[WL-TWFE-8/8] Drop WL > p50 (TWFE)...")
+            try:
+                sample_p50 = df_work['window_shock_hf_30min'] <= wl_p50
+                res, n, r2 = run_specification(
+                    df_work, rate_var, 'WL TWFE Drop>p50',
+                    sample_filter=sample_p50, quiet=True, time_effects=True
+                )
+                wl_results_twfe['(8) Drop>p50'] = {'res': res, 'n': n, 'r2': r2, 'controls': f'Drop WL>{wl_p50:.0f}min'}
+                print(f"   N = {n:,}, R2 = {r2:.4f}")
+            except Exception as e:
+                print(f"   ERROR: {e}")
+
+            # Generate TWFE LaTeX table
+            if wl_results_twfe:
+                print("\nGenerating TWFE Window Length LaTeX table...")
+
+                # Column headers for TWFE version
+                wl_col_labels_row1_twfe = [
+                    'Baseline', '+WL', '+WL', '+WL', '+WL', 'Drop', 'Drop', 'Drop',
+                ]
+                wl_col_labels_row2_twfe = [
+                    '(TWFE)', '(absorbed)', '(absorbed)', 'WLxRank', 'WLxTriple',
+                    '$>$p90', '$>$p75', '$>$p50',
+                ]
+
+                n_wl_cols_twfe = len(wl_results_twfe)
+                wl_col_align_twfe = 'l' + 'c' * n_wl_cols_twfe
+
+                wl_latex_lines_twfe = [
+                    r"\begin{table}[htbp]",
+                    r"\centering",
+                    r"\caption{Window Length Robustness - Two-Way Fixed Effects}",
+                    r"\label{tab:wl_robustness_twfe}",
+                    r"\begin{tabular}{" + wl_col_align_twfe + "}",
+                    r"\toprule",
+                ]
+
+                # Header rows
+                wl_header1_twfe = " & ".join([""] + wl_col_labels_row1_twfe[:n_wl_cols_twfe])
+                wl_header2_twfe = " & ".join([""] + wl_col_labels_row2_twfe[:n_wl_cols_twfe])
+                wl_latex_lines_twfe.append(wl_header1_twfe + r" \\")
+                wl_latex_lines_twfe.append(wl_header2_twfe + r" \\")
+                wl_latex_lines_twfe.append(" & " + " & ".join([f"({i+1})" for i in range(n_wl_cols_twfe)]) + r" \\")
+                wl_latex_lines_twfe.append(r"\midrule")
+
+                # Only 2 coefficient rows for TWFE (omega_rank and omega_rank_rate)
+                wl_coef_types_twfe = ['omega_rank', f'omega_rank_{rate_var}']
+                wl_coef_labels_twfe = {
+                    'omega_rank': r'$\omega \times Rank$',
+                    f'omega_rank_{rate_var}': r'$\omega \times Rank \times Rate$',
+                }
+
+                for coef_name in wl_coef_types_twfe:
+                    coef_row = []
+                    se_row = []
+
+                    for spec_key in wl_results_twfe.keys():
+                        res = wl_results_twfe[spec_key]['res']
+                        if coef_name in res.params.index:
+                            coef_str, se_str = format_coef_wl(
+                                res.params[coef_name],
+                                res.std_errors[coef_name],
+                                res.pvalues[coef_name]
+                            )
+                            coef_row.append(coef_str)
+                            se_row.append(se_str)
+                        else:
+                            coef_row.append("")
+                            se_row.append("")
+
+                    label = wl_coef_labels_twfe.get(coef_name, coef_name)
+                    wl_latex_lines_twfe.append(label + " & " + " & ".join(coef_row) + r" \\")
+                    wl_latex_lines_twfe.append(" & " + " & ".join(se_row) + r" \\[0.5em]")
+
+                wl_latex_lines_twfe.append(r"\midrule")
+
+                # N and R2 rows
+                wl_n_row_twfe = "Observations & " + " & ".join([f"{wl_results_twfe[k]['n']:,}" for k in wl_results_twfe.keys()]) + r" \\"
+                wl_r2_row_twfe = r"$R^2$ & " + " & ".join([f"{wl_results_twfe[k]['r2']:.4f}" for k in wl_results_twfe.keys()]) + r" \\"
+                wl_latex_lines_twfe.append(wl_n_row_twfe)
+                wl_latex_lines_twfe.append(wl_r2_row_twfe)
+
+                # Footer
+                wl_latex_lines_twfe.extend([
+                    r"\midrule",
+                    r"Firm FE & " + " & ".join(["Yes"] * n_wl_cols_twfe) + r" \\",
+                    r"Time FE & " + " & ".join(["Yes"] * n_wl_cols_twfe) + r" \\",
+                    r"Clustered SE & " + " & ".join(["Date"] * n_wl_cols_twfe) + r" \\",
+                    r"\bottomrule",
+                    r"\end{tabular}",
+                    r"\begin{tablenotes}[flushleft]",
+                    r"\footnotesize",
+                    r"\item Notes: Two-way fixed effects (firm and time FE). ",
+                    r"Columns (2)-(3) controls are absorbed by time FE. ",
+                    r"Columns (4)-(5) add WL interactions that survive TWFE (WLxRank, WLxTriple). ",
+                    f"Columns (6)-(8) drop observations with WL above p90 ({wl_p90:.0f}min), p75 ({wl_p75:.0f}min), and p50 ({wl_p50:.0f}min). ",
+                    r"Standard errors clustered by FOMC date in parentheses. ",
+                    r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
+                    r"\end{tablenotes}",
+                    r"\end{table}",
+                ])
+
+                # Save TWFE LaTeX table
+                wl_latex_file_twfe = output_tab / "table_wl_robustness_twfe.tex"
+                with open(wl_latex_file_twfe, 'w', encoding='utf-8') as f:
+                    f.write('\n'.join(wl_latex_lines_twfe))
+                print(f"\nTWFE Window length robustness LaTeX table saved to: {wl_latex_file_twfe}")
+
 print("\n" + "="*80)
 print("WINDOW LENGTH ROBUSTNESS ANALYSIS COMPLETE")
 print("="*80)
 
-
+# Cleanup: Window length results no longer needed
+if 'wl_results' in dir():
+    del wl_results
+if 'wl_results_twfe' in dir():
+    del wl_results_twfe
+gc.collect()
 
 #### New section: A few figures to visualize
 
@@ -1800,8 +2265,20 @@ plt.close()
 
 print("\nVENTILE VISUALIZATION COMPLETE")
 
-
-
+# Cleanup: Visualization intermediate dataframes
+if 'df_high' in dir():
+    del df_high
+if 'df_low' in dir():
+    del df_low
+if 'df_results_high' in dir():
+    del df_results_high
+if 'df_results_low' in dir():
+    del df_results_low
+if 'results_high' in dir():
+    del results_high
+if 'results_low' in dir():
+    del results_low
+gc.collect()
 
 
 
@@ -1987,9 +2464,8 @@ print(f"Gemini figures will be saved to: {gemini_output_path}")
 
 
 # %%
-# Try 10 year rolling window 
 
-# 2. Rolling Interaction Coefficient
+# 2. Rolling Interaction Coefficient -- relies on df_viz from Fig 1
 # 10-Year rolling window of the interaction coefficient
 
 print("\n[Gemini] Creating Rolling Interaction Plot...")
@@ -2017,20 +2493,25 @@ for i in range(0, len(dates) - window_size, step):
     df_window = df_window.set_index(['permno', 'daten'])
     
     try:
-        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']], 
-                       entity_effects=True, time_effects=True, drop_absorbed=True)
-        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=True)
-        
+        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']],
+                       entity_effects=True,
+                       # time_effects=True,
+                       drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=False)
+
         rolling_coefs.append(res.params['interaction'])
         rolling_ses.append(res.std_errors['interaction'])
         rolling_rates.append(avg_rate_window)
         rolling_dates.append(date_val)
-        
+        del mod, res  # Cleanup
+
     except:
         rolling_coefs.append(np.nan)
         rolling_ses.append(np.nan)
         rolling_rates.append(np.nan)
         rolling_dates.append(date_val)
+
+    del df_window  # Cleanup after each iteration
 
 # Convert Stata dates to Python dates for plotting
 base_date = pd.Timestamp('1960-01-01')
@@ -2062,8 +2543,93 @@ plt.close()
 
 print("Gemini figures generated.")
 
+# ============================================================================
+# TWFE Rolling Interaction Coefficient Figure
+# ============================================================================
+print("\n[Gemini] Creating TWFE Rolling Interaction Plot...")
 
+rolling_dates_twfe = []
+rolling_coefs_twfe = []
+rolling_ses_twfe = []
+rolling_rates_twfe = []
 
+for i in range(0, len(dates) - window_size, step):
+    window_dates = dates[i : i+window_size]
+    date_val = dates[i + window_size // 2]
+
+    df_window = df_robust[df_robust['daten'].isin(window_dates)].copy()
+
+    # Actual rate at date
+    avg_rate_window = df_robust[df_robust['daten'] == date_val][rate_var].mean()
+
+    df_window['interaction'] = df_window['mp_klms_U'] * df_window['ptile_consis']
+    df_window = df_window.set_index(['permno', 'daten'])
+
+    try:
+        # TWFE: entity_effects=True AND time_effects=True
+        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']],
+                       entity_effects=True,
+                       time_effects=True,  # <-- TWFE
+                       drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=False)
+
+        rolling_coefs_twfe.append(res.params['interaction'])
+        rolling_ses_twfe.append(res.std_errors['interaction'])
+        rolling_rates_twfe.append(avg_rate_window)
+        rolling_dates_twfe.append(date_val)
+        del mod, res  # Cleanup
+
+    except:
+        rolling_coefs_twfe.append(np.nan)
+        rolling_ses_twfe.append(np.nan)
+        rolling_rates_twfe.append(np.nan)
+        rolling_dates_twfe.append(date_val)
+
+    del df_window  # Cleanup after each iteration
+
+# Convert Stata dates to Python dates for plotting
+try:
+    plot_dates_twfe = [base_date + pd.Timedelta(days=int(d)) for d in rolling_dates_twfe]
+except:
+    plot_dates_twfe = rolling_dates_twfe
+
+# TWFE Dual Axis Plot
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+color = 'tab:blue'
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Interaction Coefficient (Mechanism Strength)', color=color)
+ax1.plot(plot_dates_twfe, rolling_coefs_twfe, color=color, linewidth=2, label='Interaction Coef (TWFE)')
+ax1.tick_params(axis='y', labelcolor=color)
+ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+
+ax2 = ax1.twinx()
+color = 'tab:red'
+ax2.set_ylabel(f'Interest Rate ({rate_var})', color=color)
+ax2.plot(plot_dates_twfe, rolling_rates_twfe, color=color, linestyle=':', linewidth=2, alpha=0.7, label='Interest Rate')
+ax2.tick_params(axis='y', labelcolor=color)
+
+plt.title('Time-Varying Mechanism Strength vs. Interest Rates (TWFE)')
+plt.tight_layout()
+plt.savefig(gemini_output_path / 'gemini_rolling_mechanism_twfe.png')
+plt.close()
+
+print("TWFE Rolling figure generated.")
+
+# Final cleanup: Rolling analysis dataframes
+if 'df_robust' in dir():
+    del df_robust
+if 'df_viz' in dir():
+    del df_viz
+if 'rolling_coefs' in dir():
+    del rolling_coefs, rolling_ses, rolling_rates, rolling_dates
+if 'rolling_coefs_twfe' in dir():
+    del rolling_coefs_twfe, rolling_ses_twfe, rolling_rates_twfe, rolling_dates_twfe
+gc.collect()
+
+print("\n" + "="*80)
+print("ALL ANALYSIS COMPLETE - Memory cleaned up")
+print("="*80)
 
 
 
