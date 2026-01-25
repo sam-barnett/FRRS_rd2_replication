@@ -464,12 +464,13 @@ def run_lp_regressions(df, shock_var, rate_var, rate_label, output_dir):
 
 def run_all_lp_specifications(df_merged, output_dir):
     """
-    Run LP regressions for all 5 specifications:
+    Run LP regressions for all specifications:
     1. Baseline with O/W aggregated mp_klms_U and l.target
     2. Using l.target_ma5_forward as rate interaction
     3. Using l.target_ma10_forward as rate interaction
     4. Using l.synthetic_5y_rate as rate interaction
     5. Using l.synthetic_10y_rate as rate interaction
+    6. Using l.post_0721 (indicator for 2007-2021) as rate interaction
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -480,6 +481,16 @@ def run_all_lp_specifications(df_merged, output_dir):
         print(f"Error: {shock_var} not found in merged data.")
         return
 
+    # Create indicator for 2007-2021 period
+    # This tests whether the heterogeneous effect is driven by the ZLB/low-rate era
+    if 'year' in df_merged.columns:
+        df_merged['post_0721'] = ((df_merged['year'] >= 2007) & (df_merged['year'] <= 2021)).astype(float)
+        n_post = (df_merged['post_0721'] == 1).sum()
+        n_total = len(df_merged)
+        print(f"Created post_0721 indicator: {n_post:,}/{n_total:,} obs in 2007-2021 period")
+    else:
+        print("Warning: 'year' column not found, cannot create post_0721 indicator")
+
     # Define specifications
     specifications = [
         ('target', 'baseline_target'),
@@ -487,6 +498,7 @@ def run_all_lp_specifications(df_merged, output_dir):
         ('target_ma10_forward', 'ma10_forward'),
         ('synthetic_5y_rate', 'synthetic_5y'),
         ('synthetic_10y_rate', 'synthetic_10y'),
+        ('post_0721', 'post_0721_indicator'),
     ]
 
     all_spec_results = {}
