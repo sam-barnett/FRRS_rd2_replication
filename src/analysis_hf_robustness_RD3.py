@@ -12,6 +12,8 @@ Specifications:
 
 Author: Analysis for R&R response
 Date: 2026-01-20
+
+Uses anaconda python, environment fallingrates
 """
 
 #%%
@@ -35,7 +37,7 @@ print("="*80)
 
 # Define paths (matching Stata setup_paths.do)
 base_path = Path(r"c:\Users\illge\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication")
-# base_path = Path(r"C:\Users\sb3357.SPI-9VS5N34\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication")
+base_path = Path(r"C:\Users\sb3357.SPI-9VS5N34\Princeton Dropbox\Sam Barnett\FRRS_rd2_replication")
 data_path = base_path / "FRRS_data" / "data"
 proc_analysis = data_path / "proc_analysis"
 output_tab = base_path / "FRRS_data" / "sandbox_jan2026"
@@ -78,11 +80,15 @@ df_fomc_timing['date'] = df_fomc_timing['daten'].apply(stata_to_date)
 ed_mapping_file = data_path / "highfreq" / "proc" / "fomc_hour_bonds_eurodollar_14_24.dta"
 df_ed_map, _ = pyreadstat.read_dta(str(ed_mapping_file))
 # Merge mapping into timing/main dataframe (quarter_X_ahead columns for ED contract mapping)
-ed_map_cols = ['daten', 'quarter_1_ahead', 'quarter_2_ahead', 'quarter_3_ahead']
+ed_map_cols = ['daten', 'quarter_1_ahead', 'quarter_2_ahead', 'quarter_3_ahead', 'quarter_4_ahead']
 df_fomc_info = df_fomc_timing.merge(
     df_ed_map[ed_map_cols],
     on='daten', how='left'
 )
+
+# Compute quarter_5_ahead through quarter_39_ahead by adding offsets to quarter_4_ahead
+for i in range(5, 40):
+    df_fomc_info[f'quarter_{i}_ahead'] = df_fomc_info['quarter_4_ahead'] + (i - 4)
 
 # Cleanup: df_fomc_timing and df_ed_map no longer needed
 del df_fomc_timing, df_ed_map
@@ -169,9 +175,10 @@ except Exception as e:
     df_ed = pd.DataFrame()
 
 # Function to get pre-shock futures rate (last trade before FOMC window)
-def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filter_col, value_col, lower_min=-10, cast_int=True):
+def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filter_col, value_col, lower_min=-10, cast_int=True, lookback_days=0):
     """
     Get the pre-shock value: last observation before the FOMC announcement window.
+    If no data on FOMC date, optionally look back up to lookback_days for most recent trade.
 
     Parameters:
         df: DataFrame with trade/quote data
@@ -182,17 +189,45 @@ def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filt
         value_col: column name containing the value to return (e.g., 'rate', 'yield')
         lower_min: minutes before announcement for cutoff (default -10)
         cast_int: whether to cast filter_value to int for matching (default True)
+        lookback_days: if no data on FOMC date, look back this many days (default 0 = no lookback)
+
+    Returns:
+        tuple: (value, days_back) where days_back is 0 for same-day, 1-N for lookback
     """
     if df.empty:
-        return np.nan
+        return (np.nan, 0)
+
+    # Check if filter_value is NaN
+    if pd.isna(filter_value):
+        return (np.nan, 0)
 
     # Filter to FOMC date and specified filter
     filter_val = int(filter_value) if cast_int else filter_value
     mask = (df['date'] == fomc_date) & (df[filter_col] == filter_val)
     day_data = df[mask].copy()
 
+    # If no data on FOMC date, look back up to lookback_days
+    if len(day_data) == 0 and lookback_days > 0:
+        for days_back in range(1, lookback_days + 1):
+            past_date = fomc_date - timedelta(days=days_back)
+            mask = (df['date'] == past_date) & (df[filter_col] == filter_val)
+            day_data = df[mask].copy()
+
+            if len(day_data) > 0:
+                # Found data! Use last trade from this day (closing price)
+                # No need for pre-shock filtering on past dates
+                if 'hour' in day_data.columns and 'minute' in day_data.columns:
+                    day_data = day_data.sort_values(['hour', 'minute'])
+                else:
+                    # Fallback to timen if hour/minute not available
+                    day_data = day_data.sort_values('timen')
+                return (day_data.iloc[-1][value_col], days_back)
+
+        # No data found within lookback window
+        return (np.nan, 0)
+
     if len(day_data) == 0:
-        return np.nan
+        return (np.nan, 0)
 
     # FOMC time in minutes from midnight
     fomc_time_min = fomc_hour * 60 + fomc_minute
@@ -219,9 +254,9 @@ def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filt
                 )
             else:
                 # Numeric format, assume unhandled if hour/minute cols missing
-                return np.nan
+                return (np.nan, 0)
         else:
-            return np.nan
+            return (np.nan, 0)
 
     pre_shock = day_data[day_data['trade_min'] < cutoff_min]
 
@@ -229,24 +264,30 @@ def get_preshock_value(df, fomc_date, fomc_hour, fomc_minute, filter_value, filt
         # No trades before cutoff - fall back to last trade on that day
         # Only fail if there are no trades on the day at all
         if len(day_data) == 0:
-            return np.nan
+            return (np.nan, 0)
         day_data = day_data.sort_values('trade_min')
-        return day_data.iloc[-1][value_col]
+        return (day_data.iloc[-1][value_col], 0)  # Same-day trade, days_back=0
 
-    # Return the last pre-shock value
+    # Return the last pre-shock value (same-day trade, days_back=0)
     # sort by trade_min to be sure we get the last one
     pre_shock = pre_shock.sort_values('trade_min')
-    return pre_shock.iloc[-1][value_col]
+    return (pre_shock.iloc[-1][value_col], 0)
 
 
-def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id, contract_col='exp_month', lower_min=-10):
+def get_preshock_rate(futures_df, fomc_date, fomc_hour, fomc_minute, contract_id, contract_col='exp_month', lower_min=-10, lookback_days=0):
     """
     Get the pre-shock futures rate: last trade before the FOMC announcement window.
+    If no data on FOMC date, optionally look back up to lookback_days for most recent trade.
+
     contract_id: the expiration identifier (month for FF, quarter for ED)
     contract_col: column name to match contract_id ('exp_month' or 'exp_quarter')
+    lookback_days: if no data on FOMC date, look back this many days (default 0)
+
+    Returns:
+        tuple: (rate, days_back) where days_back is 0 for same-day, 1-N for lookback
     """
     return get_preshock_value(futures_df, fomc_date, fomc_hour, fomc_minute,
-                              contract_id, contract_col, 'rate', lower_min, cast_int=True)
+                              contract_id, contract_col, 'rate', lower_min, cast_int=True, lookback_days=lookback_days)
 
 # Compute synthetic 1Y forward rate
 synthetic_rates = []
@@ -259,31 +300,72 @@ for idx, row in df_fomc_info.iterrows():
     # Needs for FF
     current_month = row['current_month']
 
-    # Needs for ED (ED2, ED3, ED4 maps to q1, q2, q3 ahead)
-    ed2_q = row['quarter_1_ahead']
-    ed3_q = row['quarter_2_ahead']
-    ed4_q = row['quarter_3_ahead']
+    # Needs for ED (ED2 maps to quarter_1_ahead, ED3 to quarter_2_ahead, etc.)
+    # Extract quarter mappings for ED2 through ED40
+    ed_quarters = {}
+    for i in range(2, 41):  # ED2 through ED40
+        ed_quarters[i] = row[f'quarter_{i-1}_ahead']
 
-    if pd.isna(fomc_date) or pd.isna(current_month) or pd.isna(ed2_q):
-        synthetic_rates.append({'daten': row['daten'], 'synthetic_1y_rate': np.nan})
+    # Always try to get raw r_ed values, even if we can't compute synthetic rates
+    # Use 7-day lookback for ED contracts (illiquid far-dated contracts may not trade daily)
+    r_ed = {}
+    r_ed_days_back = {}
+    if pd.notna(fomc_date):
+        for i in range(2, 41):
+            rate, days_back = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed_quarters[i], 'exp_quarter', lookback_days=7)
+            r_ed[i] = rate
+            r_ed_days_back[i] = days_back
+    else:
+        for i in range(2, 41):
+            r_ed[i] = np.nan
+            r_ed_days_back[i] = 0
+
+    # Skip synthetic rate calculation if basic info is missing
+    if pd.isna(fomc_date) or pd.isna(current_month):
+        result = {
+            'daten': row['daten'],
+            'synthetic_1y_rate': np.nan,
+            'synthed_10y': np.nan
+        }
+        for i in range(2, 41):
+            result[f'r_ed{i}'] = r_ed[i]
+            result[f'r_ed{i}_days_back'] = r_ed_days_back[i]
+        # FF values not available in this case
+        result['r_ff1'] = np.nan
+        result['r_ff2'] = np.nan
+        result['r_ff1_days_back'] = 0
+        result['r_ff2_days_back'] = 0
+        synthetic_rates.append(result)
         continue
 
-    # 1. FF1 (Current Month)
-    r_ff1 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month')
+    # 1. FF1 (Current Month) - FF futures are very liquid, no lookback needed
+    r_ff1, ff1_days_back = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month', lookback_days=0)
 
-    # 2. FF2 (Next Month)
+    # 2. FF2 (Next Month) - FF futures are very liquid, no lookback needed
     next_month = int(current_month) + 1
-    r_ff2 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month')
+    r_ff2, ff2_days_back = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month', lookback_days=0)
 
-    # 3. ED2, ED3, ED4 (df_ed is pre-filtered to have ED pre-2022 and SOFR 2022+)
-    r_ed2 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed2_q, 'exp_quarter')
-    r_ed3 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed3_q, 'exp_quarter')
-    r_ed4 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed4_q, 'exp_quarter')
-    
-    # Check if we have all components
+    # 3. Create forward-filled ED rates for synthetic rate calculation
+    # If ED[i] is missing after 7-day lookback, use ED[i-1] (cross-sectional forward-fill)
+    # This is a fallback for contracts that never traded within the lookback window
+    r_ed_filled = {}
+    for i in range(2, 41):
+        if pd.notna(r_ed[i]):
+            r_ed_filled[i] = r_ed[i]
+        elif i > 2 and pd.notna(r_ed_filled.get(i-1)):
+            r_ed_filled[i] = r_ed_filled[i-1]
+        else:
+            r_ed_filled[i] = np.nan
+
+    # Aliases for backward compatibility in the 1Y rate calculation
+    r_ed2 = r_ed_filled[2]
+    r_ed3 = r_ed_filled[3]
+    r_ed4 = r_ed_filled[4]
+
+    # Check if we have all components for 1Y rate
     rates = [r_ff1, r_ff2, r_ed2, r_ed3, r_ed4]
     if all(pd.notna(r) for r in rates):
-        # Geometric chaining
+        # Geometric chaining for 1Y rate
         # FF1: 1 month (1/12 of year)
         # FF2: 1 month (1/12 of year)
         # ED2: 3 months (3/12)
@@ -293,252 +375,428 @@ for idx, row in df_fomc_info.iterrows():
         # Actually standard construction often ignores the gap or assumes ED starts immediately after FF2?
         # A common approx for 1-year rate is just the average of these, or compounded.
         # We will compound them over their respective durations.
-        
+
         # Convert percentages to decimals
         d_ff1 = r_ff1 / 100
         d_ff2 = r_ff2 / 100
         d_ed2 = r_ed2 / 100
         d_ed3 = r_ed3 / 100
         d_ed4 = r_ed4 / 100
-        
+
         # Compound
         # (1 + R_1y) = (1+FF1)^(1/12) * (1+FF2)^(1/12) * (1+ED2)^(3/12) * (1+ED3)^(3/12) * (1+ED4)^(3/12)
         term = (1+d_ff1)**(1/12) * (1+d_ff2)**(1/12) * (1+d_ed2)**(0.25) * (1+d_ed3)**(0.25) * (1+d_ed4)**(0.25)
-        
-        # Wait: 1/12 + 1/12 + 3/12 + 3/12 + 3/12 = 11/12. 
+
+        # Wait: 1/12 + 1/12 + 3/12 + 3/12 + 3/12 = 11/12.
         # To get an annualized rate over this periods effective duration?
-        # Or scale to 12 months? 
+        # Or scale to 12 months?
         # If we interpret this as a 11-month spot rate, we can annualize it.
         # Or assumes the last month is same as ED4?
         # Let's annualize the 11-month return to 12 months.
         # (1 + R_annual) = term^(12/11).
-        
+
         # Alternatively, using these as proxies for the 1y rate:
         # Just simple average? GSS papers use path factor.
         # But for "synthetic 1Y rate level", calculating the zero-coupon equivalent is best.
         # Let's use the annualized version of the 11-month chain.
-        
+
         R_1y = (term**(12/11) - 1) * 100
-        
-        synthetic_rates.append({
+
+        result = {
             'daten': row['daten'],
             'synthetic_1y_rate': R_1y,
             'components_count': 5
-        })
+        }
     else:
-        # Partial construction? 
-        # If we have at least some, maybe simple average?
-        # Sticky point: if missing any, better to be missing than wrong.
-        synthetic_rates.append({'daten': row['daten'], 'synthetic_1y_rate': np.nan})
+        result = {'daten': row['daten'], 'synthetic_1y_rate': np.nan}
+
+    # Compute synthed_10y using FF1, FF2, and ED2-ED40 (with forward-filling)
+    # FF1: 1 month, FF2: 1 month, ED2-ED40: 39 quarters = 117 months
+    # Total: 119 months ≈ 9.92 years
+    rates_10y = [r_ff1, r_ff2] + [r_ed_filled[i] for i in range(2, 41)]
+    if all(pd.notna(r) for r in rates_10y):
+        # Convert to decimals
+        d_ff1 = r_ff1 / 100
+        d_ff2 = r_ff2 / 100
+
+        # Geometric chain: FF1^(1/12) * FF2^(1/12) * ED2^(0.25) * ... * ED40^(0.25)
+        term_10y = (1 + d_ff1)**(1/12) * (1 + d_ff2)**(1/12)
+        for i in range(2, 41):
+            term_10y *= (1 + r_ed_filled[i]/100)**0.25
+
+        # Annualize: term_10y is growth over 119 months
+        # (1 + R_annual) = term_10y^(12/119) to convert to annual rate
+        R_10y = (term_10y**(12/119) - 1) * 100
+        result['synthed_10y'] = R_10y
+    else:
+        result['synthed_10y'] = np.nan
+
+    # Add all raw r_ed values (ED2 through ED40) - NOT the filled versions
+    # Also store days_back for diagnostics
+    for i in range(2, 41):
+        result[f'r_ed{i}'] = r_ed[i]
+        result[f'r_ed{i}_days_back'] = r_ed_days_back[i]
+
+    # Store FF rates and their days_back
+    result['r_ff1'] = r_ff1
+    result['r_ff2'] = r_ff2
+    result['r_ff1_days_back'] = ff1_days_back
+    result['r_ff2_days_back'] = ff2_days_back
+
+    synthetic_rates.append(result)
 
 df_synthetic = pd.DataFrame(synthetic_rates)
+
+# Show summary statistics for synthetic rates
 n_valid = df_synthetic['synthetic_1y_rate'].notna().sum()
 print(f"   - Constructed synthetic 1Y rate for {n_valid}/{len(df_synthetic)} FOMC dates")
 if n_valid > 0:
     print(f"   - synthetic_1y_rate: mean = {df_synthetic['synthetic_1y_rate'].mean():.3f}, range = [{df_synthetic['synthetic_1y_rate'].min():.2f}, {df_synthetic['synthetic_1y_rate'].max():.2f}]")
 
-# Merge synthetic rate into main data
-if 'synthetic_1y_rate' in df.columns:
-    df = df.drop(columns=['synthetic_1y_rate'])
-df = df.merge(df_synthetic[['daten', 'synthetic_1y_rate']], on='daten', how='left')
+n_valid_10y = df_synthetic['synthed_10y'].notna().sum()
+print(f"   - Constructed synthed_10y rate for {n_valid_10y}/{len(df_synthetic)} FOMC dates")
+if n_valid_10y > 0:
+    print(f"   - synthed_10y: mean = {df_synthetic['synthed_10y'].mean():.3f}, range = [{df_synthetic['synthed_10y'].min():.2f}, {df_synthetic['synthed_10y'].max():.2f}]")
+
+# Show ED contract coverage
+print(f"\n   - ED contract coverage:")
+for ed_num in [5, 10, 20, 30, 40]:
+    if f'r_ed{ed_num}' in df_synthetic.columns:
+        coverage = df_synthetic[f'r_ed{ed_num}'].notna().sum()
+        pct = 100 * coverage / len(df_synthetic)
+        print(f"     ED{ed_num}: {coverage}/{len(df_synthetic)} dates ({pct:.1f}%)")
+
+# ============================================================================
+# LOOKBACK DIAGNOSTICS
+# ============================================================================
+print(f"\n   - Lookback diagnostics for ED contracts (7-day lookback window):")
+
+# Aggregate statistics across all ED contracts
+ed_days_back_cols = [f'r_ed{i}_days_back' for i in range(2, 41)]
+all_days_back = []
+for col in ed_days_back_cols:
+    if col in df_synthetic.columns:
+        # Only include non-nan ED values
+        ed_num = int(col.split('_')[1].replace('ed', ''))
+        mask = df_synthetic[f'r_ed{ed_num}'].notna()
+        all_days_back.extend(df_synthetic.loc[mask, col].tolist())
+
+if all_days_back:
+    total_values = len(all_days_back)
+    same_day = sum(1 for d in all_days_back if d == 0)
+    lookback_1_3 = sum(1 for d in all_days_back if 1 <= d <= 3)
+    lookback_4_7 = sum(1 for d in all_days_back if 4 <= d <= 7)
+
+    pct_same_day = 100 * same_day / total_values
+    pct_1_3 = 100 * lookback_1_3 / total_values
+    pct_4_7 = 100 * lookback_4_7 / total_values
+
+    print(f"     Overall: {pct_same_day:.1f}% same-day, {pct_1_3:.1f}% from 1-3 days, {pct_4_7:.1f}% from 4-7 days")
+    print(f"     (Total: {total_values} ED contract values across all FOMC dates)")
+
+# Per-contract statistics for selected contracts
+print(f"\n   - Per-contract lookback statistics:")
+for ed_num in [10, 20, 30, 40]:
+    col_rate = f'r_ed{ed_num}'
+    col_days = f'r_ed{ed_num}_days_back'
+    if col_rate in df_synthetic.columns and col_days in df_synthetic.columns:
+        mask = df_synthetic[col_rate].notna()
+        if mask.sum() > 0:
+            days_back_values = df_synthetic.loc[mask, col_days]
+            same_day = (days_back_values == 0).sum()
+            lookback_1_3 = ((days_back_values >= 1) & (days_back_values <= 3)).sum()
+            lookback_4_7 = ((days_back_values >= 4) & (days_back_values <= 7)).sum()
+            total = mask.sum()
+
+            pct_same = 100 * same_day / total
+            pct_1_3 = 100 * lookback_1_3 / total
+            pct_4_7 = 100 * lookback_4_7 / total
+
+            print(f"     ED{ed_num}: {pct_same:.1f}% same-day, {pct_1_3:.1f}% from 1-3 days, {pct_4_7:.1f}% from 4-7 days (n={total})")
+
+# ============================================================================
+# PLOT ED COVERAGE (ED5-ED40) BEFORE FORWARD-FILLING [targets correct, non-forward filled data]
+# ============================================================================
+print("\n   Creating ED coverage plot (ED5-ED40)...")
+
+# Count non-missing values for each ED contract
+ed_coverage = {}
+for i in range(5, 41):
+    if f'r_ed{i}' in df_synthetic.columns:
+        ed_coverage[i] = df_synthetic[f'r_ed{i}'].notna().sum()
+    else:
+        ed_coverage[i] = 0
+
+if ed_coverage:
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ed_nums = list(ed_coverage.keys())
+    counts = list(ed_coverage.values())
+
+    ax.plot(ed_nums, counts, marker='o', linewidth=2, markersize=6, color='steelblue')
+    ax.axhline(y=len(df_synthetic), color='red', linestyle='--', linewidth=1, alpha=0.5, label='Total FOMC dates')
+
+    ax.set_xlabel('ED Contract Number', fontsize=11)
+    ax.set_ylabel('Number of Non-Missing Dates', fontsize=11)
+    ax.set_title('ED Contract Coverage (Before Forward-Filling)', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle='--')
+
+    plt.tight_layout()
+    coverage_file = output_fig / "ed_coverage_5_40.png"
+    plt.savefig(coverage_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - Saved ED coverage plot to {coverage_file}")
+
+    # Print summary statistics
+    print(f"   - ED5 coverage: {ed_coverage[5]:,}/{len(df_synthetic)} dates ({100*ed_coverage[5]/len(df_synthetic):.1f}%)")
+    print(f"   - ED20 coverage: {ed_coverage[20]:,}/{len(df_synthetic)} dates ({100*ed_coverage[20]/len(df_synthetic):.1f}%)")
+    print(f"   - ED40 coverage: {ed_coverage[40]:,}/{len(df_synthetic)} dates ({100*ed_coverage[40]/len(df_synthetic):.1f}%)")
+else:
+    print("   - WARNING: No ED coverage data to plot")
+
+# Merge synthetic rate and r_ed values into main data
+merge_cols = ['daten', 'synthetic_1y_rate', 'synthed_10y'] + [f'r_ed{i}' for i in range(2, 41)]
+for col in merge_cols[1:]:  # Skip 'daten'
+    if col in df.columns:
+        df = df.drop(columns=[col])
+df = df.merge(df_synthetic[merge_cols], on='daten', how='left')
 
 # Cleanup: synthetic_rates list and df_synthetic no longer needed
 del synthetic_rates, df_synthetic
 gc.collect()
 
 # ============================================================================
-# CONSTRUCT SYNTHETIC 10Y EXPECTED RATE
-# ============================================================================
-# Chain: FF1, FF2 (months 1-2), ED2-4 (months 3-12), 2Y, 5Y, 10Y Treasury yields
-# This gives a measure of the expected average rate environment over the next 10 years
+# PLOT SYNTHED_10Y OVER TIME
 # ============================================================================
 
-print("\n   Constructing synthetic 10Y expected rate...")
+print("\n   Creating plot of synthed_10y...")
 
-# Load bond highfreq data for pre-shock treasury yields
-print("   - Loading bond highfreq data for 2Y, 5Y, 10Y yields...")
+# Prepare data for plotting
+plot_df = df[['daten', 'synthed_10y', 'synthetic_1y_rate']].dropna().copy()
+plot_df['date'] = plot_df['daten'].apply(stata_to_date)
+plot_df = plot_df.sort_values('date')
 
-bond_pre_file = data_path / "highfreq" / "proc" / "bond_highfreq_pre_2009_final24.dta"
-bond_post_file = data_path / "highfreq" / "proc" / "bond_highfreq_post_2009_final24.dta"
+if len(plot_df) > 0:
+    fig, ax = plt.subplots(figsize=(12, 6))
+    ax.scatter(plot_df['date'], plot_df['synthed_10y'], s=20, color='steelblue', alpha=0.7, label='Synthed 10Y Rate')
+    ax.scatter(plot_df['date'], plot_df['synthetic_1y_rate'], s=20, color='orange', alpha=0.7, label='Synthetic 1Y Rate')
+    ax.axhline(y=0, color='black', linestyle='-', linewidth=0.5, alpha=0.3)
 
-df_bonds = pd.DataFrame()
-try:
-    # Load pre-2009
-    if bond_pre_file.exists():
-        df_bond_pre, _ = pyreadstat.read_dta(str(bond_pre_file))
-        df_bond_pre = df_bond_pre[df_bond_pre['daten'].isin(fomc_dates_stata)].copy()
-        print(f"     Pre-2009 bonds: {len(df_bond_pre):,} obs on FOMC dates")
-    else:
-        df_bond_pre = pd.DataFrame()
-        print(f"     WARNING: {bond_pre_file} not found")
+    ax.set_xlabel('Date', fontsize=11)
+    ax.set_ylabel('Rate (%)', fontsize=11)
+    ax.set_title('Synthetic 10-Year Forward Rate (FF1, FF2, ED2-ED40)', fontsize=12, fontweight='bold')
+    ax.legend(loc='best', fontsize=10)
+    ax.grid(True, alpha=0.3, linestyle='--')
 
-    # Load post-2009
-    if bond_post_file.exists():
-        df_bond_post, _ = pyreadstat.read_dta(str(bond_post_file))
-        df_bond_post = df_bond_post[df_bond_post['daten'].isin(fomc_dates_stata)].copy()
-        print(f"     Post-2009 bonds: {len(df_bond_post):,} obs on FOMC dates")
-    else:
-        df_bond_post = pd.DataFrame()
-        print(f"     WARNING: {bond_post_file} not found")
+    plt.tight_layout()
+    plot_file = output_fig / "synthed_10y_timeseries.png"
+    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"   - Saved plot to {plot_file}")
+else:
+    print("   - WARNING: No valid synthed_10y data to plot")
 
-    # Combine
-    if not df_bond_pre.empty or not df_bond_post.empty:
-        df_bonds = pd.concat([df_bond_pre, df_bond_post], ignore_index=True)
-        df_bonds['date'] = df_bonds['daten'].apply(stata_to_date)
-        print(f"     Combined bonds: {len(df_bonds):,} obs")
-        print(f"     Maturities available: {df_bonds['mat'].unique().tolist()}")
+# # ============================================================================
+# # CONSTRUCT SYNTHETIC 10Y EXPECTED RATE
+# # ============================================================================
+# # Chain: FF1, FF2 (months 1-2), ED2-4 (months 3-12), 2Y, 5Y, 10Y Treasury yields
+# # This gives a measure of the expected average rate environment over the next 10 years
+# # ============================================================================
 
-except Exception as e:
-    print(f"   - ERROR loading bond data: {e}")
+# print("\n   Constructing synthetic 10Y expected rate...")
 
-def get_preshock_bond_yield(bonds_df, fomc_date, fomc_hour, fomc_minute, maturity, lower_min=-10):
-    """
-    Get pre-shock bond yield for a given maturity (2Y, 5Y, 10Y).
-    """
-    return get_preshock_value(bonds_df, fomc_date, fomc_hour, fomc_minute,
-                              maturity, 'mat', 'yield', lower_min, cast_int=False)
+# # Load bond highfreq data for pre-shock treasury yields
+# print("   - Loading bond highfreq data for 2Y, 5Y, 10Y yields...")
 
-# Compute synthetic 10Y expected rate
-synthetic_10y_rates = []
+# bond_pre_file = data_path / "highfreq" / "proc" / "bond_highfreq_pre_2009_final24.dta"
+# bond_post_file = data_path / "highfreq" / "proc" / "bond_highfreq_post_2009_final24.dta"
 
-for idx, row in df_fomc_info.iterrows():
-    fomc_date = row['date']
-    fomc_hour = row['hour']
-    fomc_minute = row['minute']
-    daten = row['daten']
+# df_bonds = pd.DataFrame()
+# try:
+#     # Load pre-2009
+#     if bond_pre_file.exists():
+#         df_bond_pre, _ = pyreadstat.read_dta(str(bond_pre_file))
+#         df_bond_pre = df_bond_pre[df_bond_pre['daten'].isin(fomc_dates_stata)].copy()
+#         print(f"     Pre-2009 bonds: {len(df_bond_pre):,} obs on FOMC dates")
+#     else:
+#         df_bond_pre = pd.DataFrame()
+#         print(f"     WARNING: {bond_pre_file} not found")
 
-    # Get 1Y synthetic rate components
-    current_month = row['current_month']
-    ed2_q = row['quarter_1_ahead']
-    ed3_q = row['quarter_2_ahead']
-    ed4_q = row['quarter_3_ahead']
+#     # Load post-2009
+#     if bond_post_file.exists():
+#         df_bond_post, _ = pyreadstat.read_dta(str(bond_post_file))
+#         df_bond_post = df_bond_post[df_bond_post['daten'].isin(fomc_dates_stata)].copy()
+#         print(f"     Post-2009 bonds: {len(df_bond_post):,} obs on FOMC dates")
+#     else:
+#         df_bond_post = pd.DataFrame()
+#         print(f"     WARNING: {bond_post_file} not found")
 
-    if pd.isna(fomc_date) or pd.isna(current_month) or pd.isna(ed2_q):
-        synthetic_10y_rates.append({'daten': daten, 'synthetic_10y_rate': np.nan})
-        continue
+#     # Combine
+#     if not df_bond_pre.empty or not df_bond_post.empty:
+#         df_bonds = pd.concat([df_bond_pre, df_bond_post], ignore_index=True)
+#         df_bonds['date'] = df_bonds['daten'].apply(stata_to_date)
+#         print(f"     Combined bonds: {len(df_bonds):,} obs")
+#         print(f"     Maturities available: {df_bonds['mat'].unique().tolist()}")
 
-    # 1. Get futures rates (FF1, FF2, ED2-4) for year 1
-    r_ff1 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month')
-    next_month = int(current_month) + 1
-    r_ff2 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month')
-    # ED2-4 (df_ed is pre-filtered to have ED pre-2022 and SOFR 2022+)
-    r_ed2 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed2_q, 'exp_quarter')
-    r_ed3 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed3_q, 'exp_quarter')
-    r_ed4 = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed4_q, 'exp_quarter')
+# except Exception as e:
+#     print(f"   - ERROR loading bond data: {e}")
 
-    # 2. Get Treasury yields for years 2-10
-    r_2y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '2Y')
-    r_5y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '5Y')
-    r_10y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '10Y')
+# def get_preshock_bond_yield(bonds_df, fomc_date, fomc_hour, fomc_minute, maturity, lower_min=-10):
+#     """
+#     Get pre-shock bond yield for a given maturity (2Y, 5Y, 10Y).
+#     """
+#     return get_preshock_value(bonds_df, fomc_date, fomc_hour, fomc_minute,
+#                               maturity, 'mat', 'yield', lower_min, cast_int=False)
 
-    # Check if we have all components
-    futures_rates = [r_ff1, r_ff2, r_ed2, r_ed3, r_ed4]
-    treasury_rates = [r_2y, r_5y, r_10y]
+# # Compute synthetic 10Y expected rate
+# synthetic_10y_rates = []
 
-    if all(pd.notna(r) for r in futures_rates) and all(pd.notna(r) for r in treasury_rates):
-        # Chain the rates to get 10-year expected average rate
-        # Approach: Use forward rates implied by the term structure
-        # - Year 0-1: Use futures chain (FF1, FF2, ED2-4)
-        # - Year 1-2: Implied forward from 2Y yield
-        # - Year 2-5: Implied forward from 5Y yield
-        # - Year 5-10: Implied forward from 10Y yield
+# for idx, row in df_fomc_info.iterrows():
+#     fomc_date = row['date']
+#     fomc_hour = row['hour']
+#     fomc_minute = row['minute']
+#     daten = row['daten']
 
-        # Convert to decimals
-        d_ff1 = r_ff1 / 100
-        d_ff2 = r_ff2 / 100
-        d_ed2 = r_ed2 / 100
-        d_ed3 = r_ed3 / 100
-        d_ed4 = r_ed4 / 100
-        d_2y = r_2y / 100
-        d_5y = r_5y / 100
-        d_10y = r_10y / 100
+#     # Get 1Y synthetic rate components
+#     current_month = row['current_month']
 
-        # Compute 1Y rate from futures
-        term_1y = (1+d_ff1)**(1/12) * (1+d_ff2)**(1/12) * (1+d_ed2)**(0.25) * (1+d_ed3)**(0.25) * (1+d_ed4)**(0.25)
-        r_1y = (term_1y**(12/11) - 1)  # annualized, in decimal
+#     # Extract quarter mappings for ED2 through ED20
+#     ed_quarters = {}
+#     for i in range(2, 21):  # ED2 through ED20
+#         ed_quarters[i] = row[f'quarter_{i-1}_ahead']
 
-        # Implied forward rates from Treasury curve
-        f_1_2 = ((1+d_2y)**2 / (1+r_1y)**1)**(1/1) - 1
-        f_2_5 = ((1+d_5y)**5 / (1+d_2y)**2)**(1/3) - 1
-        f_5_10 = ((1+d_10y)**10 / (1+d_5y)**5)**(1/5) - 1
+#     if pd.isna(fomc_date) or pd.isna(current_month) or pd.isna(ed_quarters[2]):
+#         synthetic_10y_rates.append({'daten': daten, 'synthetic_10y_rate': np.nan})
+#         continue
 
-        # Average expected rate over 5 years (duration-weighted)
-        # Year 0-1: r_1y, Year 1-2: f_1_2, Years 2-5: f_2_5
-        avg_5y_rate = (1*r_1y + 1*f_1_2 + 3*f_2_5) / 5
+#     # 1. Get futures rates (FF1, FF2, ED2-20) for year 1
+#     r_ff1 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, current_month, 'exp_month')
+#     next_month = int(current_month) + 1
+#     r_ff2 = get_preshock_rate(df_ff, fomc_date, fomc_hour, fomc_minute, next_month, 'exp_month')
+#     # ED2-20 (df_ed is pre-filtered to have ED pre-2022 and SOFR 2022+)
+#     r_ed = {}
+#     for i in range(2, 21):
+#         r_ed[i] = get_preshock_rate(df_ed, fomc_date, fomc_hour, fomc_minute, ed_quarters[i], 'exp_quarter')
 
-        # Average expected rate over 10 years (duration-weighted)
-        avg_10y_rate = (1*r_1y + 1*f_1_2 + 3*f_2_5 + 5*f_5_10) / 10
+#     # Aliases for backward compatibility
+#     r_ed2 = r_ed[2]
+#     r_ed3 = r_ed[3]
+#     r_ed4 = r_ed[4]
 
-        # Convert back to percentage
-        R_5y = avg_5y_rate * 100
-        R_10y = avg_10y_rate * 100
+#     # 2. Get Treasury yields for years 2-10
+#     r_2y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '2Y')
+#     r_5y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '5Y')
+#     r_10y = get_preshock_bond_yield(df_bonds, fomc_date, fomc_hour, fomc_minute, '10Y')
 
-        synthetic_10y_rates.append({
-            'daten': daten,
-            'synthetic_5y_rate': R_5y,
-            'synthetic_10y_rate': R_10y,
-            'r_1y': r_1y * 100,
-            'f_1_2': f_1_2 * 100,
-            'f_2_5': f_2_5 * 100,
-            'f_5_10': f_5_10 * 100
-        })
-    else:
-        # Track which components are missing for diagnostics
-        missing_futures = [name for name, val in [('FF1', r_ff1), ('FF2', r_ff2), ('ED2', r_ed2), ('ED3', r_ed3), ('ED4', r_ed4)] if pd.isna(val)]
-        missing_treasury = [name for name, val in [('2Y', r_2y), ('5Y', r_5y), ('10Y', r_10y)] if pd.isna(val)]
-        synthetic_10y_rates.append({
-            'daten': daten,
-            'synthetic_5y_rate': np.nan,
-            'synthetic_10y_rate': np.nan,
-            'missing_futures': ','.join(missing_futures) if missing_futures else '',
-            'missing_treasury': ','.join(missing_treasury) if missing_treasury else ''
-        })
+#     # Check if we have all components
+#     futures_rates = [r_ff1, r_ff2, r_ed2, r_ed3, r_ed4]
+#     treasury_rates = [r_2y, r_5y, r_10y]
 
-df_synthetic_10y = pd.DataFrame(synthetic_10y_rates)
-n_valid_5y = df_synthetic_10y['synthetic_5y_rate'].notna().sum()
-n_valid_10y = df_synthetic_10y['synthetic_10y_rate'].notna().sum()
-n_missing = len(df_synthetic_10y) - n_valid_10y
+#     if all(pd.notna(r) for r in futures_rates) and all(pd.notna(r) for r in treasury_rates):
+#         # Chain the rates to get 10-year expected average rate
+#         # Approach: Use forward rates implied by the term structure
+#         # - Year 0-1: Use futures chain (FF1, FF2, ED2-4)
+#         # - Year 1-2: Implied forward from 2Y yield
+#         # - Year 2-5: Implied forward from 5Y yield
+#         # - Year 5-10: Implied forward from 10Y yield
 
-# Diagnostic: Show why values are missing
-if n_missing > 0:
-    missing_df = df_synthetic_10y[df_synthetic_10y['synthetic_10y_rate'].isna()].copy()
-    if 'missing_futures' in missing_df.columns and 'missing_treasury' in missing_df.columns:
-        # Count missing by component
-        futures_missing_count = missing_df['missing_futures'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
-        treasury_missing_count = missing_df['missing_treasury'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
+#         # Convert to decimals
+#         d_ff1 = r_ff1 / 100
+#         d_ff2 = r_ff2 / 100
+#         d_ed2 = r_ed2 / 100
+#         d_ed3 = r_ed3 / 100
+#         d_ed4 = r_ed4 / 100
+#         d_2y = r_2y / 100
+#         d_5y = r_5y / 100
+#         d_10y = r_10y / 100
 
-        # Find most common missing components
-        all_missing_futures = ','.join(missing_df['missing_futures'].dropna()).split(',')
-        all_missing_treasury = ','.join(missing_df['missing_treasury'].dropna()).split(',')
+#         # Compute 1Y rate from futures
+#         term_1y = (1+d_ff1)**(1/12) * (1+d_ff2)**(1/12) * (1+d_ed2)**(0.25) * (1+d_ed3)**(0.25) * (1+d_ed4)**(0.25)
+#         r_1y = (term_1y**(12/11) - 1)  # annualized, in decimal
 
-        from collections import Counter
-        futures_counts = Counter([x for x in all_missing_futures if x])
-        treasury_counts = Counter([x for x in all_missing_treasury if x])
+#         # Implied forward rates from Treasury curve
+#         f_1_2 = ((1+d_2y)**2 / (1+r_1y)**1)**(1/1) - 1
+#         f_2_5 = ((1+d_5y)**5 / (1+d_2y)**2)**(1/3) - 1
+#         f_5_10 = ((1+d_10y)**10 / (1+d_5y)**5)**(1/5) - 1
 
-        print(f"   - DIAGNOSTIC: {n_missing} FOMC dates missing synthetic rates")
-        if futures_counts:
-            print(f"     Missing futures: {dict(futures_counts)}")
-        if treasury_counts:
-            print(f"     Missing treasury: {dict(treasury_counts)}")
+#         # Average expected rate over 5 years (duration-weighted)
+#         # Year 0-1: r_1y, Year 1-2: f_1_2, Years 2-5: f_2_5
+#         avg_5y_rate = (1*r_1y + 1*f_1_2 + 3*f_2_5) / 5
 
-print(f"   - Constructed synthetic 5Y rate for {n_valid_5y}/{len(df_synthetic_10y)} FOMC dates")
-if n_valid_5y > 0:
-    print(f"   - synthetic_5y_rate: mean = {df_synthetic_10y['synthetic_5y_rate'].mean():.3f}, range = [{df_synthetic_10y['synthetic_5y_rate'].min():.2f}, {df_synthetic_10y['synthetic_5y_rate'].max():.2f}]")
-print(f"   - Constructed synthetic 10Y rate for {n_valid_10y}/{len(df_synthetic_10y)} FOMC dates")
-if n_valid_10y > 0:
-    print(f"   - synthetic_10y_rate: mean = {df_synthetic_10y['synthetic_10y_rate'].mean():.3f}, range = [{df_synthetic_10y['synthetic_10y_rate'].min():.2f}, {df_synthetic_10y['synthetic_10y_rate'].max():.2f}]")
+#         # Average expected rate over 10 years (duration-weighted)
+#         avg_10y_rate = (1*r_1y + 1*f_1_2 + 3*f_2_5 + 5*f_5_10) / 10
 
-# Merge synthetic 5Y and 10Y rates into main data
-for col in ['synthetic_5y_rate', 'synthetic_10y_rate']:
-    if col in df.columns:
-        df = df.drop(columns=[col])
-df = df.merge(df_synthetic_10y[['daten', 'synthetic_5y_rate', 'synthetic_10y_rate']], on='daten', how='left')
+#         # Convert back to percentage
+#         R_5y = avg_5y_rate * 100
+#         R_10y = avg_10y_rate * 100
+
+#         synthetic_10y_rates.append({
+#             'daten': daten,
+#             'synthetic_5y_rate': R_5y,
+#             'synthetic_10y_rate': R_10y,
+#             'r_1y': r_1y * 100,
+#             'f_1_2': f_1_2 * 100,
+#             'f_2_5': f_2_5 * 100,
+#             'f_5_10': f_5_10 * 100
+#         })
+#     else:
+#         # Track which components are missing for diagnostics
+#         missing_futures = [('FF1', r_ff1), ('FF2', r_ff2)] + [(f'ED{i}', r_ed[i]) for i in range(2, 21)]
+#         missing_futures = [name for name, val in missing_futures if pd.isna(val)]
+#         missing_treasury = [name for name, val in [('2Y', r_2y), ('5Y', r_5y), ('10Y', r_10y)] if pd.isna(val)]
+#         synthetic_10y_rates.append({
+#             'daten': daten,
+#             'synthetic_5y_rate': np.nan,
+#             'synthetic_10y_rate': np.nan,
+#             'missing_futures': ','.join(missing_futures) if missing_futures else '',
+#             'missing_treasury': ','.join(missing_treasury) if missing_treasury else ''
+#         })
+
+# df_synthetic_10y = pd.DataFrame(synthetic_10y_rates)
+# n_valid_5y = df_synthetic_10y['synthetic_5y_rate'].notna().sum()
+# n_valid_10y = df_synthetic_10y['synthetic_10y_rate'].notna().sum()
+# n_missing = len(df_synthetic_10y) - n_valid_10y
+
+# # Diagnostic: Show why values are missing
+# if n_missing > 0:
+#     missing_df = df_synthetic_10y[df_synthetic_10y['synthetic_10y_rate'].isna()].copy()
+#     if 'missing_futures' in missing_df.columns and 'missing_treasury' in missing_df.columns:
+#         # Count missing by component
+#         futures_missing_count = missing_df['missing_futures'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
+#         treasury_missing_count = missing_df['missing_treasury'].apply(lambda x: len(x.split(',')) if isinstance(x, str) and x else 0).sum()
+
+#         # Find most common missing components
+#         all_missing_futures = ','.join(missing_df['missing_futures'].dropna()).split(',')
+#         all_missing_treasury = ','.join(missing_df['missing_treasury'].dropna()).split(',')
+
+#         from collections import Counter
+#         futures_counts = Counter([x for x in all_missing_futures if x])
+#         treasury_counts = Counter([x for x in all_missing_treasury if x])
+
+#         print(f"   - DIAGNOSTIC: {n_missing} FOMC dates missing synthetic rates")
+#         if futures_counts:
+#             print(f"     Missing futures: {dict(futures_counts)}")
+#         if treasury_counts:
+#             print(f"     Missing treasury: {dict(treasury_counts)}")
+
+# print(f"   - Constructed synthetic 5Y rate for {n_valid_5y}/{len(df_synthetic_10y)} FOMC dates")
+# if n_valid_5y > 0:
+#     print(f"   - synthetic_5y_rate: mean = {df_synthetic_10y['synthetic_5y_rate'].mean():.3f}, range = [{df_synthetic_10y['synthetic_5y_rate'].min():.2f}, {df_synthetic_10y['synthetic_5y_rate'].max():.2f}]")
+# print(f"   - Constructed synthetic 10Y rate for {n_valid_10y}/{len(df_synthetic_10y)} FOMC dates")
+# if n_valid_10y > 0:
+#     print(f"   - synthetic_10y_rate: mean = {df_synthetic_10y['synthetic_10y_rate'].mean():.3f}, range = [{df_synthetic_10y['synthetic_10y_rate'].min():.2f}, {df_synthetic_10y['synthetic_10y_rate'].max():.2f}]")
+
+# # Merge synthetic 5Y and 10Y rates into main data
+# for col in ['synthetic_5y_rate', 'synthetic_10y_rate']:
+#     if col in df.columns:
+#         df = df.drop(columns=[col])
+# df = df.merge(df_synthetic_10y[['daten', 'synthetic_5y_rate', 'synthetic_10y_rate']], on='daten', how='left')
 
 # Cleanup: High-frequency futures and bond data no longer needed
 print("\n   Cleaning up high-frequency data from memory...")
-del synthetic_10y_rates, df_synthetic_10y
-if 'df_bonds' in dir() and df_bonds is not None:
-    del df_bonds
+# del synthetic_10y_rates, df_synthetic_10y
+# if 'df_bonds' in dir() and df_bonds is not None:
+#     del df_bonds
 if 'df_ff' in dir():
     del df_ff
 if 'df_ed' in dir():
@@ -555,7 +813,8 @@ print("\n   Interpolating missing synthetic rates at FOMC-date level...")
 
 # Get unique FOMC dates with their synthetic rates
 fomc_dates = df[['daten']].drop_duplicates().sort_values('daten').reset_index(drop=True)
-synthetic_cols = ['synthetic_1y_rate', 'synthetic_5y_rate', 'synthetic_10y_rate']
+# synthetic_cols = ['synthetic_1y_rate', 'synthetic_5y_rate', 'synthetic_10y_rate']
+synthetic_cols = ['synthetic_1y_rate', 'synthed_10y']  # Adjusted to match constructed rates
 
 # For each synthetic rate, get the unique values per FOMC date and interpolate
 for col in synthetic_cols:
@@ -636,20 +895,34 @@ try:
     df_tp['date'] = pd.to_datetime(df_tp['observation_date'])
     df_tp['TP10'] = pd.to_numeric(df_tp['THREEFYTP10'], errors='coerce')
     df_tp['daten'] = (df_tp['date'] - datetime(1960, 1, 1)).dt.days
+
+    # 4. DGS10 
+    url_dgs10 = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+    df_dgs10 = pd.read_csv(url_dgs10)
+    df_dgs10['date'] = pd.to_datetime(df_dgs10['observation_date'])
+    df_dgs10['DGS10'] = pd.to_numeric(df_dgs10['DGS10'], errors='coerce')
+    df_dgs10['daten'] = (df_dgs10['date'] - datetime(1960, 1, 1)).dt.days
     
     # Merge all
-    for sub_df in [df_3mo, df_spr, df_tp]:
+    for sub_df in [df_3mo, df_spr, df_tp, df_dgs10]:
         cols = [c for c in sub_df.columns if c not in ['date', 'observation_date', 'THREEFYTP10']]
         # merge on daten (drop if exists)
         for c in cols:
             if c != 'daten' and c in df.columns:
                 df = df.drop(columns=[c])
         df = df.merge(sub_df[cols], on='daten', how='left')
-        
+
     # Compute Rate Expectations
     # rate_expectations = (DGS3MO + T10Y3M) - ACMTP10
     # Here we use TP10 (THREEFYTP10) as proxy
     df['rate_expectations'] = (df['DGS3MO'] + df['T10Y3M']) - df['TP10']
+
+    # Compute DGS10 minus Term Premium (expected short rate path from 10Y yield)
+    df['DGS10_minus_TP10'] = df['DGS10'] - df['TP10']
+    n_dgs10 = df['DGS10'].notna().sum()
+    n_dgs10_minus_tp = df['DGS10_minus_TP10'].notna().sum()
+    print(f"   - DGS10: {n_dgs10:,} observations")
+    print(f"   - DGS10 minus TP10: {n_dgs10_minus_tp:,} observations")
     
     n_exp = df['rate_expectations'].notna().sum()
     print(f"   - Constructed rate_expectations: {n_exp:,} observations")
@@ -766,20 +1039,27 @@ if 'target' in df_sched.columns:
     else:
         print("   WARNING: Cannot create rate_slope - missing synthetic_1y_rate or target")
 
-    # Spec 4c: Synthetic 5-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y Treasury)
-    if 'synthetic_5y_rate' in df_sched.columns:
-        n_valid = df_sched['synthetic_5y_rate'].notna().sum()
-        print(f"   - synthetic_5y_rate (5Y expected avg rate): {n_valid:,} valid obs, mean = {df_sched['synthetic_5y_rate'].mean():.3f}, range = [{df_sched['synthetic_5y_rate'].min():.2f}, {df_sched['synthetic_5y_rate'].max():.2f}]")
+    # Synthed_10y: Synthetic 10-year forward rate (FF1, FF2, ED2-ED40)
+    if 'synthed_10y' in df_sched.columns:
+        n_valid = df_sched['synthed_10y'].notna().sum()
+        print(f"   - synthed_10y (10Y forward rate from futures): {n_valid:,} valid obs, mean = {df_sched['synthed_10y'].mean():.3f}, range = [{df_sched['synthed_10y'].min():.2f}, {df_sched['synthed_10y'].max():.2f}]")
     else:
-        print("   WARNING: 'synthetic_5y_rate' not found in merged data")
+        print("   WARNING: 'synthed_10y' not found in merged data")
 
-    # Spec 4d: Synthetic 10-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y, 10Y Treasury)
-    # This is the average expected rate over the next 10 years
-    if 'synthetic_10y_rate' in df_sched.columns:
-        n_valid = df_sched['synthetic_10y_rate'].notna().sum()
-        print(f"   - synthetic_10y_rate (10Y expected avg rate): {n_valid:,} valid obs, mean = {df_sched['synthetic_10y_rate'].mean():.3f}, range = [{df_sched['synthetic_10y_rate'].min():.2f}, {df_sched['synthetic_10y_rate'].max():.2f}]")
-    else:
-        print("   WARNING: 'synthetic_10y_rate' not found in merged data")
+    # # Spec 4c: Synthetic 5-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y Treasury)
+    # if 'synthetic_5y_rate' in df_sched.columns:
+    #     n_valid = df_sched['synthetic_5y_rate'].notna().sum()
+    #     print(f"   - synthetic_5y_rate (5Y expected avg rate): {n_valid:,} valid obs, mean = {df_sched['synthetic_5y_rate'].mean():.3f}, range = [{df_sched['synthetic_5y_rate'].min():.2f}, {df_sched['synthetic_5y_rate'].max():.2f}]")
+    # else:
+    #     print("   WARNING: 'synthetic_5y_rate' not found in merged data")
+
+    # # Spec 4d: Synthetic 10-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y, 10Y Treasury)
+    # # This is the average expected rate over the next 10 years
+    # if 'synthetic_10y_rate' in df_sched.columns:
+    #     n_valid = df_sched['synthetic_10y_rate'].notna().sum()
+    #     print(f"   - synthetic_10y_rate (10Y expected avg rate): {n_valid:,} valid obs, mean = {df_sched['synthetic_10y_rate'].mean():.3f}, range = [{df_sched['synthetic_10y_rate'].min():.2f}, {df_sched['synthetic_10y_rate'].max():.2f}]")
+    # else:
+    #     print("   WARNING: 'synthetic_10y_rate' not found in merged data")
 else:
     print("   WARNING: 'target' variable not found. Checking alternative names...")
     # Try to find it with alternative names
@@ -817,7 +1097,7 @@ print(f"\n   Saved sandbox data to: {sandbox_file}")
 # Save daily (FOMC-level) data with key rate measures and shock variable
 print("\n   Saving daily FOMC-level rate data...")
 fomc_rate_cols = ['daten', 'mp_klms_U', 'target_ma5_forward', 'target_ma10_forward',
-                  'synthetic_5y_rate', 'synthetic_10y_rate']
+                  'synthetic_1y_rate', 'synthed_10y', 'DGS10', 'DGS10_minus_TP10']
 # Filter to columns that exist
 existing_cols = [c for c in fomc_rate_cols if c in df_work.columns]
 missing_cols = [c for c in fomc_rate_cols if c not in df_work.columns]
@@ -830,6 +1110,11 @@ fomc_daily_file = sandbox_dir / "fomc_daily_rates.csv"
 df_fomc_daily.to_csv(fomc_daily_file, index=False)
 print(f"   - Saved {len(df_fomc_daily)} FOMC dates to: {fomc_daily_file}")
 print(f"   - Columns: {existing_cols}")
+
+################################ ^ DATA CONSTRUCTION COMPLETE ^ ################################
+
+################################ v ANALYSIS / REGRESSION v ################################
+
 
 #%%
 # ============================================================================
@@ -1066,27 +1351,38 @@ if 'DGS2' in df_work.columns:
 else:
     print("SKIPPED: No DGS2 variable available")
 
-# Spec 4c: Synthetic 5-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y Treasury)
-print("\n[14/18] SPEC 4c: Synthetic 5-Year Expected Rate...")
-if 'synthetic_5y_rate' in df_work.columns and df_work['synthetic_5y_rate'].notna().sum() > 0:
+# Spec 4c: Synthed_10y (FF1, FF2, ED2-ED40)
+print("\n[14/18] SPEC 4c: Synthed 10Y Forward Rate...")
+if 'synthed_10y' in df_work.columns and df_work['synthed_10y'].notna().sum() > 0:
     try:
-        res, n, r2 = run_specification(df_work, 'synthetic_5y_rate', 'SPEC 4c: Synthetic 5Y Expected Rate')
-        results_dict['Spec 4c: Synthetic 5Y Rate'] = {'res': res, 'n': n, 'r2': r2}
+        res, n, r2 = run_specification(df_work, 'synthed_10y', 'SPEC 4c: Synthed 10Y Forward Rate')
+        results_dict['Spec 4c: Synthed 10Y'] = {'res': res, 'n': n, 'r2': r2}
     except Exception as e:
         print(f"ERROR in Spec 4c: {e}")
 else:
-    print("SKIPPED: No synthetic_5y_rate variable found or all values missing")
+    print("SKIPPED: No synthed_10y variable found or all values missing")
 
-# Spec 4d: Synthetic 10-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y, 10Y Treasury)
-print("\n[15/18] SPEC 4d: Synthetic 10-Year Expected Rate...")
-if 'synthetic_10y_rate' in df_work.columns and df_work['synthetic_10y_rate'].notna().sum() > 0:
-    try:
-        res, n, r2 = run_specification(df_work, 'synthetic_10y_rate', 'SPEC 4d: Synthetic 10Y Expected Rate')
-        results_dict['Spec 4d: Synthetic 10Y Rate'] = {'res': res, 'n': n, 'r2': r2}
-    except Exception as e:
-        print(f"ERROR in Spec 4d: {e}")
-else:
-    print("SKIPPED: No synthetic_10y_rate variable found or all values missing")
+# # Spec 4c-old: Synthetic 5-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y Treasury)
+# print("\n[14/18] SPEC 4c: Synthetic 5-Year Expected Rate...")
+# if 'synthetic_5y_rate' in df_work.columns and df_work['synthetic_5y_rate'].notna().sum() > 0:
+#     try:
+#         res, n, r2 = run_specification(df_work, 'synthetic_5y_rate', 'SPEC 4c: Synthetic 5Y Expected Rate')
+#         results_dict['Spec 4c: Synthetic 5Y Rate'] = {'res': res, 'n': n, 'r2': r2}
+#     except Exception as e:
+#         print(f"ERROR in Spec 4c: {e}")
+# else:
+#     print("SKIPPED: No synthetic_5y_rate variable found or all values missing")
+
+# # Spec 4d: Synthetic 10-year expected rate (FF1, FF2, ED2-4, 2Y, 5Y, 10Y Treasury)
+# print("\n[15/18] SPEC 4d: Synthetic 10-Year Expected Rate...")
+# if 'synthetic_10y_rate' in df_work.columns and df_work['synthetic_10y_rate'].notna().sum() > 0:
+#     try:
+#         res, n, r2 = run_specification(df_work, 'synthetic_10y_rate', 'SPEC 4d: Synthetic 10Y Expected Rate')
+#         results_dict['Spec 4d: Synthetic 10Y Rate'] = {'res': res, 'n': n, 'r2': r2}
+#     except Exception as e:
+#         print(f"ERROR in Spec 4d: {e}")
+# else:
+#     print("SKIPPED: No synthetic_10y_rate variable found or all values missing")
 
 # Spec 5: Rate Expectations (Model-Based)
 print("\n[16/18] SPEC 5: Rate Expectations (Risk-Neutral Yield)...")
@@ -1113,6 +1409,26 @@ if 'TP10' in df_work.columns:
         print(f"ERROR in Spec 6: {e}")
 else:
     print("SKIPPED: No TP10 variable available")
+
+print("\n[18/20] SPEC 7: DGS10 (10-Year Treasury Yield)...")
+if 'DGS10' in df_work.columns and df_work['DGS10'].notna().sum() > 0:
+    try:
+        res, n, r2 = run_specification(df_work, 'DGS10', 'SPEC 7: DGS10 (10-Year Treasury Yield)')
+        results_dict['Spec 7: DGS10'] = {'res': res, 'n': n, 'r2': r2}
+    except Exception as e:
+        print(f"ERROR in Spec 7: {e}")
+else:
+    print("SKIPPED: No DGS10 variable available")
+
+print("\n[19/20] SPEC 8: DGS10 - TP10 (10Y Expected Rate Path)...")
+if 'DGS10_minus_TP10' in df_work.columns and df_work['DGS10_minus_TP10'].notna().sum() > 0:
+    try:
+        res, n, r2 = run_specification(df_work, 'DGS10_minus_TP10', 'SPEC 8: DGS10 - TP10 (10Y Expected Rate Path)')
+        results_dict['Spec 8: DGS10 - TP10'] = {'res': res, 'n': n, 'r2': r2}
+    except Exception as e:
+        print(f"ERROR in Spec 8: {e}")
+else:
+    print("SKIPPED: No DGS10_minus_TP10 variable available")
 
 # ============================================================================
 # PHASE 14: CREATE SUMMARY TABLE
@@ -1187,14 +1503,18 @@ if results_dict:
     print("GENERATING LATEX TABLE")
     print("="*80)
 
-    # Define the 6 specifications for the LaTeX table
+    # Define the specifications for the LaTeX table
     latex_specs = [
         ('post_original', 'Original', '(2007-2024)'),
         ('post_alt', 'Revised', '(2007-2021)'),
         ('target_ma5_forward', 'MA5', 'Forward'),
         ('target_ma10_forward', 'MA10', 'Forward'),
-        ('synthetic_5y_rate', 'Synthetic', '5Y Rate'),
-        ('synthetic_10y_rate', 'Synthetic', '10Y Rate'),
+        ('synthetic_1y_rate', 'Synthetic', '1Y Rate'),
+        ('synthed_10y', 'Synthed', '10Y Fwd'),
+        ('DGS10', 'DGS10', '10Y Yield'),
+        ('DGS10_minus_TP10', 'DGS10-TP10', 'Exp. Rate'),
+        # ('synthetic_5y_rate', 'Synthetic', '5Y Rate'),
+        # ('synthetic_10y_rate', 'Synthetic', '10Y Rate'),
     ]
 
     # Run specifications and collect results
@@ -1438,7 +1758,7 @@ else:
 
 #%%
 # ============================================================================
-# TEST SPEC: TWFE WITH LAGGED FFR
+# TEST SPEC: TWFE WITH LAGGED FFR -- not significant
 # ============================================================================
 # Simple test: Use lagged federal funds rate as the rate variable in TWFE
 # This tests whether the heterogeneous effect depends on past rate levels
@@ -1543,7 +1863,8 @@ print("="*80)
 if 'window_shock_hf_30min' not in df_work.columns:
     print("ERROR: 'window_shock_hf_30min' not found in data. Cannot run window length robustness.")
 else:
-    rate_var = 'synthetic_10y_rate'  # Using synthetic 10Y expected rate for this robustness check
+    rate_var = 'synthed_10y'  # Using synthed_10y forward rate for this robustness check
+    # rate_var = 'synthetic_10y_rate'  # Using synthetic 10Y expected rate for this robustness check
 
     if rate_var not in df_work.columns:
         print(f"ERROR: '{rate_var}' not found. Cannot run window length robustness.")
@@ -2021,10 +2342,10 @@ gc.collect()
 
 #%%
 # ============================================================================
-# FIGURE 1: Treatment Effect by ptile_consis Ventile, Split by 10Y Synthetic Rate
+# FIGURE 1: Treatment Effect by ptile_consis Ventile, Split by 10 Treasury rate # 10Y Synthetic Rate
 # ============================================================================
 # This figure shows how the treatment effect varies across the ptile_consis
-# distribution, separately for periods when the 10Y synthetic rate is above vs below median.
+# distribution, separately for periods when the 10Y synthetic rate is above vs below p25 and p75 # median.
 
 print("\n" + "="*80)
 print("VISUALIZATION: Treatment Effect by ptile_consis Ventile")
@@ -2052,24 +2373,38 @@ print(firm_ptile['ventile'].value_counts().sort_index())
 # Merge ventile tags back to main data
 df_viz = df_work.merge(firm_ptile[['permno', 'ventile', 'ventile_num']], on='permno', how='left')
 
-# Split by 10Y synthetic rate median
-print("\n[2/4] Splitting sample by 10Y synthetic rate median...")
-if 'synthetic_10y_rate' in df_viz.columns:
-    rate_var = 'synthetic_10y_rate'
+# Split by DGS10 rate mean # median
+print("\n[2/4] Splitting sample by DGS10 rate mean...")
+if 'DGS10' in df_viz.columns:
+    rate_var = 'DGS10' # =============================================================== RATE VAR FOR ALL MAIN FIGURES
+elif 'synthetic_1y_rate' in df_viz.columns:
+    rate_var = 'synthetic_1y_rate'
+    print(f"   WARNING: Using {rate_var} as fallback (DGS10 not available)")
 elif 'target_ma10_forward' in df_viz.columns:
     rate_var = 'target_ma10_forward'
-    print(f"   WARNING: Using {rate_var} as fallback (synthetic_10y_rate not available)")
+    print(f"   WARNING: Using {rate_var} as fallback")
 else:
     rate_var = 'target_ma5_forward'
     print(f"   WARNING: Using {rate_var} as fallback")
 
-rate_median = df_viz[rate_var].median()
-print(f"   Using rate variable: {rate_var}")
-print(f"   Median rate: {rate_median:.3f}")
+# rate_median = df_viz[rate_var].median()
 
-df_viz['high_rate'] = (df_viz[rate_var] >= rate_median).astype(int)
-print(f"   High rate periods: {df_viz['high_rate'].sum():,} obs")
-print(f"   Low rate periods: {(1 - df_viz['high_rate']).sum():,} obs")
+# rate_mean = df_viz[rate_var].mean()
+# rate_median = rate_mean  # Use mean as cutoff, not median. 
+
+# get p25 and p75 of rate variable dist 
+rate_p25 = df_viz[rate_var].quantile(0.25)
+rate_p75 = df_viz[rate_var].quantile(0.75)
+
+print(f"   Using rate variable: {rate_var}")
+# print(f"   Median rate: {rate_median:.3f}")
+
+# df_viz['high_rate'] = (df_viz[rate_var] >= rate_median).astype(int)
+df_viz['high_rate'] = (df_viz[rate_var] >= rate_p75) 
+df_viz['low_rate'] = (df_viz[rate_var] <= rate_p25)
+
+# print(f"   High rate periods: {df_viz['high_rate'].sum():,} obs")
+# print(f"   Low rate periods: {(1 - df_viz['high_rate']).sum():,} obs")
 
 # Run regressions for each ventile within each rate regime
 print("\n[3/4] Running regressions by ventile and rate regime...")
@@ -2078,7 +2413,7 @@ def run_ventile_regression(df_sub, ventile_val, quiet=False):
     """
     Run a simple specification on a subset of data for a given ventile.
 
-    Model: shock_hf_30min = α_i + β * mp_klms_U + ε
+    Model: shock_hf_30min = \alpha_i + β * mp_klms_U + ε
 
     With firm (permno) fixed effects and cluster(daten) standard errors.
     Returns the coefficient β on mp_klms_U.
@@ -2141,7 +2476,7 @@ for v in ventiles:
 
 # Low rate regime
 print("   Running for LOW rate regime...")
-df_low = df_viz[df_viz['high_rate'] == 0]
+df_low = df_viz[df_viz['low_rate'] == 1]
 for v in ventiles:
     coef, se, n = run_ventile_regression(df_low, v)
     results_low['ventile'].append(v)
@@ -2182,7 +2517,7 @@ if mask_high.any():
 ax.axhline(y=0, color='black', linewidth=0.5, linestyle='--')
 ax.set_xlabel('ptile_consis Ventile (Firm-Level)', fontsize=11)
 ax.set_ylabel(r'Coefficient on $\omega$ (mp_klms_U)', fontsize=11)
-ax.set_title(f'HIGH Rate Regime\n({rate_var} ≥ {rate_median:.2f})', fontsize=12)
+ax.set_title(f'HIGH Rate Regime\n({rate_var} ≥ {rate_p75:.2f})', fontsize=12)
 ax.set_xticks(ventiles)
 ax.set_xticklabels([str(v) for v in ventiles], rotation=45)
 ax.grid(True, alpha=0.3)
@@ -2210,7 +2545,7 @@ if mask_low.any():
 
 ax.axhline(y=0, color='black', linewidth=0.5, linestyle='--')
 ax.set_xlabel('ptile_consis Ventile (Firm-Level)', fontsize=11)
-ax.set_title(f'LOW Rate Regime\n({rate_var} < {rate_median:.2f})', fontsize=12)
+ax.set_title(f'LOW Rate Regime\n({rate_var} < {rate_p25:.2f})', fontsize=12)
 ax.set_xticks(ventiles)
 ax.set_xticklabels([str(v) for v in ventiles], rotation=45)
 ax.grid(True, alpha=0.3)
@@ -2232,7 +2567,7 @@ if mask_high.any():
     # Plot points with error bars (no connecting line)
     ax.errorbar(x_high - 0.5, y_high, yerr=se_high,
                 fmt='o', color='darkred', capsize=3, capthick=1, markersize=6,
-                label=f'High Rate (≥ {rate_median:.2f})')
+                label=f'High Rate (≥ {rate_p75:.2f})')
 
     # Plot regression line
     ax.plot(x_fit, slope_high * x_fit + intercept_high,
@@ -2242,7 +2577,7 @@ if mask_low.any():
     # Plot points with error bars (no connecting line)
     ax.errorbar(x_low + 0.5, y_low, yerr=se_low,
                 fmt='s', color='darkblue', capsize=3, capthick=1, markersize=6,
-                label=f'Low Rate (< {rate_median:.2f})')
+                label=f'Low Rate (< {rate_p25:.2f})')
 
     # Plot regression line
     ax.plot(x_fit, slope_low * x_fit + intercept_low,
@@ -2616,6 +2951,159 @@ plt.close()
 
 print("TWFE Rolling figure generated.")
 
+
+
+# %% Version: Use DGS10_minus_TP10
+newrate_var = 'DGS10_minus_TP10'
+
+print("\n[Gemini] Creating Rolling Interaction Plot...")
+df_robust = df_viz.copy()
+# Sliding window of dates
+dates = sorted(df_robust['daten'].unique())
+window_size = 80 # Approx 10 years (8 meetings/year)
+step = 10
+
+rolling_dates = []
+rolling_coefs = []
+rolling_ses = []
+rolling_rates = []
+
+for i in range(0, len(dates) - window_size, step):
+    window_dates = dates[i : i+window_size]
+    date_val = dates[i + window_size // 2]
+    
+    df_window = df_robust[df_robust['daten'].isin(window_dates)].copy()
+    
+    # Avg rate in window -- NO! Actual rate at date 
+    avg_rate_window = df_robust[df_robust['daten'] == date_val][newrate_var].mean()
+    
+    df_window['interaction'] = df_window['mp_klms_U'] * df_window['ptile_consis']
+    df_window = df_window.set_index(['permno', 'daten'])
+    
+    try:
+        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']],
+                       entity_effects=True,
+                       # time_effects=True,
+                       drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=False)
+
+        rolling_coefs.append(res.params['interaction'])
+        rolling_ses.append(res.std_errors['interaction'])
+        rolling_rates.append(avg_rate_window)
+        rolling_dates.append(date_val)
+        del mod, res  # Cleanup
+
+    except:
+        rolling_coefs.append(np.nan)
+        rolling_ses.append(np.nan)
+        rolling_rates.append(np.nan)
+        rolling_dates.append(date_val)
+
+    del df_window  # Cleanup after each iteration
+
+# Convert Stata dates to Python dates for plotting
+base_date = pd.Timestamp('1960-01-01')
+try:
+    plot_dates = [base_date + pd.Timedelta(days=int(d)) for d in rolling_dates]
+except:
+    plot_dates = rolling_dates
+
+# Dual Axis Plot
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+color = 'tab:blue'
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Interaction Coefficient (Mechanism Strength)', color=color)
+ax1.plot(plot_dates, rolling_coefs, color=color, linewidth=2, label='Interaction Coef')
+ax1.tick_params(axis='y', labelcolor=color)
+ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+
+ax2 = ax1.twinx()  
+color = 'tab:red'
+ax2.set_ylabel(f'Interest Rate ({newrate_var})', color=color)  
+ax2.plot(plot_dates, rolling_rates, color=color, linestyle=':', linewidth=2, alpha=0.7, label='Interest Rate')
+ax2.tick_params(axis='y', labelcolor=color)
+
+plt.title('Time-Varying Mechanism Strength vs. Interest Rates')
+plt.tight_layout()
+plt.savefig(gemini_output_path / 'gemini_rolling_mechanism_DGS_TP.png')
+plt.close()
+
+print("Gemini figures generated.")
+
+# ============================================================================
+# TWFE Rolling Interaction Coefficient Figure
+# ============================================================================
+print("\n[Gemini] Creating TWFE Rolling Interaction Plot...")
+
+rolling_dates_twfe = []
+rolling_coefs_twfe = []
+rolling_ses_twfe = []
+rolling_rates_twfe = []
+
+for i in range(0, len(dates) - window_size, step):
+    window_dates = dates[i : i+window_size]
+    date_val = dates[i + window_size // 2]
+
+    df_window = df_robust[df_robust['daten'].isin(window_dates)].copy()
+
+    # Actual rate at date
+    avg_rate_window = df_robust[df_robust['daten'] == date_val][newrate_var].mean()
+
+    df_window['interaction'] = df_window['mp_klms_U'] * df_window['ptile_consis']
+    df_window = df_window.set_index(['permno', 'daten'])
+
+    try:
+        # TWFE: entity_effects=True AND time_effects=True
+        mod = PanelOLS(df_window['shock_hf_30min'], df_window[['interaction']],
+                       entity_effects=True,
+                       time_effects=True,  # <-- TWFE
+                       drop_absorbed=True)
+        res = mod.fit(cov_type='clustered', cluster_entity=True, cluster_time=False)
+
+        rolling_coefs_twfe.append(res.params['interaction'])
+        rolling_ses_twfe.append(res.std_errors['interaction'])
+        rolling_rates_twfe.append(avg_rate_window)
+        rolling_dates_twfe.append(date_val)
+        del mod, res  # Cleanup
+
+    except:
+        rolling_coefs_twfe.append(np.nan)
+        rolling_ses_twfe.append(np.nan)
+        rolling_rates_twfe.append(np.nan)
+        rolling_dates_twfe.append(date_val)
+
+    del df_window  # Cleanup after each iteration
+
+# Convert Stata dates to Python dates for plotting
+try:
+    plot_dates_twfe = [base_date + pd.Timedelta(days=int(d)) for d in rolling_dates_twfe]
+except:
+    plot_dates_twfe = rolling_dates_twfe
+
+# TWFE Dual Axis Plot
+fig, ax1 = plt.subplots(figsize=(12, 6))
+
+color = 'tab:blue'
+ax1.set_xlabel('Date')
+ax1.set_ylabel('Interaction Coefficient (Mechanism Strength)', color=color)
+ax1.plot(plot_dates_twfe, rolling_coefs_twfe, color=color, linewidth=2, label='Interaction Coef (TWFE)')
+ax1.tick_params(axis='y', labelcolor=color)
+ax1.axhline(0, color='gray', linestyle='--', alpha=0.5)
+
+ax2 = ax1.twinx()
+color = 'tab:red'
+ax2.set_ylabel(f'Interest Rate ({newrate_var})', color=color)
+ax2.plot(plot_dates_twfe, rolling_rates_twfe, color=color, linestyle=':', linewidth=2, alpha=0.7, label='Interest Rate')
+ax2.tick_params(axis='y', labelcolor=color)
+
+plt.title('Time-Varying Mechanism Strength vs. Interest Rates (TWFE)')
+plt.tight_layout()
+plt.savefig(gemini_output_path / 'gemini_rolling_mechanism_twfe_DGS_TP.png')
+plt.close()
+
+print("TWFE Rolling figure generated.")
+
 # Final cleanup: Rolling analysis dataframes
 if 'df_robust' in dir():
     del df_robust
@@ -2630,7 +3118,4 @@ gc.collect()
 print("\n" + "="*80)
 print("ALL ANALYSIS COMPLETE - Memory cleaned up")
 print("="*80)
-
-
-
 # %%

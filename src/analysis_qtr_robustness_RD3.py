@@ -116,7 +116,7 @@ def main():
     agg_shocks.rename(columns={'weighted_shock': shock_var}, inplace=True)
     
     print("Aggregating rates...")
-    rate_vars = ['target_ma5_forward', 'target_ma10_forward', 'synthetic_5y_rate', 'synthetic_10y_rate', 'target_ma3', 'target_ma5', 'target_ma10']
+    rate_vars = ['target_ma5_forward', 'target_ma10_forward', 'synthetic_5y_rate', 'synthetic_10y_rate', 'target_ma3', 'target_ma5', 'target_ma10', 'DGS10', 'DGS10_minus_TP10']
     valid_rates = [c for c in rate_vars if c in df_daily.columns]
     
     agg_rates = df_daily.groupby(['year', 'quarter'])[valid_rates].mean().reset_index()
@@ -499,6 +499,8 @@ def run_all_lp_specifications(df_merged, output_dir):
         ('synthetic_5y_rate', 'synthetic_5y'),
         ('synthetic_10y_rate', 'synthetic_10y'),
         ('post_0721', 'post_0721_indicator'),
+        ('DGS10', 'DGS10'),
+        ('DGS10_minus_TP10', 'DGS10_minus_TP10')
     ]
 
     all_spec_results = {}
