@@ -640,8 +640,11 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
         'target_ma10_forward': 'target_ma10_forward'
     }
 
-    # Lag lengths to test (quarterly data: 1-4 quarters)
-    lag_lengths = [1, 2, 3, 4]
+    # Lag lengths to test (quarterly data: 1-12 quarters = up to 3 years)
+    lag_lengths = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+
+    # Representative lags for IRF figures (to keep output manageable)
+    irf_lag_lengths = [1, 4, 8, 12]
 
     # Check availability
     available_lp_specs = {k: v for k, v in lp_specs.items() if v in df_qtr.columns}
@@ -702,8 +705,8 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
                             'best_bic': n_lags == best_bic_lag
                         })
 
-        # Run full IRFs for each lag length
-        for n_lags in lag_lengths:
+        # Run full IRFs for representative lag lengths only
+        for n_lags in irf_lag_lengths:
             print(f"\n  Computing IRFs with {n_lags} lag(s)...")
 
             all_results = {}
@@ -804,12 +807,13 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
         if f"{test_yvar}0_gk" not in df_qtr.columns:
             continue
 
-        fig, axes = plt.subplots(2, 2, figsize=(12, 10))
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
 
-        colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
+        # Colors for representative lags in IRF comparison (top plots)
+        irf_colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
 
         for ax_idx, (ax, coef_type) in enumerate(zip(axes.flatten()[:2], ['beta_zlb', 'beta_delta'])):
-            for n_lags, color in zip(lag_lengths, colors):
+            for n_lags, color in zip(irf_lag_lengths, irf_colors):
                 horizons = []
                 coefs = []
                 ci_lo = []
@@ -836,6 +840,10 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
             ax.legend(loc='best')
             ax.grid(True, alpha=0.3)
 
+        # Colormap for all 12 lags in bar charts (bottom plots)
+        cmap = plt.cm.viridis
+        bar_colors = [cmap(i / (len(lag_lengths) - 1)) for i in range(len(lag_lengths))]
+
         # AIC/BIC comparison bar chart
         ax = axes[1, 0]
         aic_by_lag = {n_lags: [] for n_lags in lag_lengths}
@@ -847,9 +855,10 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
 
         x = np.arange(len(lag_lengths))
         mean_aics = [np.mean(aic_by_lag[n]) if aic_by_lag[n] else np.nan for n in lag_lengths]
-        ax.bar(x, mean_aics, color=colors)
+        ax.bar(x, mean_aics, color=bar_colors)
         ax.set_xticks(x)
-        ax.set_xticklabels([f'{n} lag{"s" if n > 1 else ""}' for n in lag_lengths])
+        ax.set_xticklabels([str(n) for n in lag_lengths], fontsize=9)
+        ax.set_xlabel('Number of lags')
         ax.set_ylabel('Mean AIC (lower is better)')
         ax.set_title('AIC by Lag Length (across outcomes)')
         ax.grid(True, alpha=0.3, axis='y')
@@ -864,9 +873,10 @@ if df_qtr is not None and 'DGS10' in df_qtr.columns:
                     bic_by_lag[n_lags].append(res['bic'])
 
         mean_bics = [np.mean(bic_by_lag[n]) if bic_by_lag[n] else np.nan for n in lag_lengths]
-        ax.bar(x, mean_bics, color=colors)
+        ax.bar(x, mean_bics, color=bar_colors)
         ax.set_xticks(x)
-        ax.set_xticklabels([f'{n} lag{"s" if n > 1 else ""}' for n in lag_lengths])
+        ax.set_xticklabels([str(n) for n in lag_lengths], fontsize=9)
+        ax.set_xlabel('Number of lags')
         ax.set_ylabel('Mean BIC (lower is better)')
         ax.set_title('BIC by Lag Length (across outcomes)')
         ax.grid(True, alpha=0.3, axis='y')
