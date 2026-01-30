@@ -1863,8 +1863,8 @@ print("="*80)
 if 'window_shock_hf_30min' not in df_work.columns:
     print("ERROR: 'window_shock_hf_30min' not found in data. Cannot run window length robustness.")
 else:
-    rate_var = 'synthed_10y'  # Using synthed_10y forward rate for this robustness check
-    # rate_var = 'synthetic_10y_rate'  # Using synthetic 10Y expected rate for this robustness check
+    rate_var = 'DGS10'  # Using DGS10 (10-Year Treasury Yield) for this robustness check
+    # rate_var = 'synthed_10y'  # Alternative: Using synthed_10y forward rate for this robustness check
 
     if rate_var not in df_work.columns:
         print(f"ERROR: '{rate_var}' not found. Cannot run window length robustness.")
@@ -2103,22 +2103,22 @@ else:
             wl_latex_lines.append(wl_r2_row)
 
             # Footer
-            wl_latex_lines.extend([
-                r"\midrule",
-                r"Firm FE & " + " & ".join(["Yes"] * n_wl_cols) + r" \\",
-                r"Clustered SE & " + " & ".join(["Date"] * n_wl_cols) + r" \\",
-                r"\bottomrule",
-                r"\end{tabular}",
-                r"\begin{tablenotes}[flushleft]",
-                r"\footnotesize",
-                r"\item Notes: Robustness to window length (WL) variation. Columns (1)-(5) progressively add WL controls and interactions. ",
-                f"Columns (6)-(8) drop observations with WL above p90 ({wl_p90:.0f}min), p75 ({wl_p75:.0f}min), and p50 ({wl_p50:.0f}min). ",
-                r"Rate variable is synthetic 10-year expected rate. ",
-                r"Standard errors clustered by FOMC date in parentheses. ",
-                r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
-                r"\end{tablenotes}",
-                r"\end{table}",
-            ])
+            # wl_latex_lines.extend([
+            #     r"\midrule",
+            #     r"Firm FE & " + " & ".join(["Yes"] * n_wl_cols) + r" \\",
+            #     r"Clustered SE & " + " & ".join(["Date"] * n_wl_cols) + r" \\",
+            #     r"\bottomrule",
+            #     r"\end{tabular}",
+            #     r"\begin{tablenotes}[flushleft]",
+            #     r"\footnotesize",
+            #     r"\item Notes: Robustness to window length (WL) variation. Columns (1)-(5) progressively add WL controls and interactions. ",
+            #     f"Columns (6)-(8) drop observations with WL above p90 ({wl_p90:.0f}min), p75 ({wl_p75:.0f}min), and p50 ({wl_p50:.0f}min). ",
+            #     r"Rate variable is DGS10 (10-Year Treasury Yield). ",
+            #     r"Standard errors clustered by FOMC date in parentheses. ",
+            #     r"*** p$<$0.01, ** p$<$0.05, * p$<$0.1.",
+            #     r"\end{tablenotes}",
+            #     r"\end{table}",
+            # ])
 
             # Save LaTeX table
             wl_latex_file = output_tab / "table_wl_robustness.tex"
